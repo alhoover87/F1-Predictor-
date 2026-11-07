@@ -12,10 +12,8 @@ st.set_page_config(page_title="F1 Podium Predictor", page_icon="🏁", layout="w
 fastf1.Cache.enable_cache("/tmp")
 
 QUALI_WEIGHTS = {"FP1": 0.20, "FP2": 0.35, "FP3": 0.45}
-HISTORY_START_YEAR = 2021
-GRID_WEIGHT_MIN = 0.15
-GRID_WEIGHT_MAX = 0.55
-GRID_WEIGHT_DEFAULT = 0.25
+FIRST_SEASON = 2021
+GRID_WEIGHT_DEFAULT = 25  # percent; adjustable in the sidebar
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -244,65 +242,6 @@ def load_session_laps(year, round_number, session_name, event):
     return None, None, " || ".join(errors)
 
 
-# ---------- Per-circuit history (2021 onward) ----------
-@st.cache_data(ttl=86400, show_spinner=False)
-def load_race_history(circuit_key, end_year):
-    """Race results since HISTORY_START_YEAR for ONE circuit, matched on event Location."""
-    rows = []
-    for yr in range(HISTORY_START_YEAR, end_year + 1):
-        try:
-            sched = get_schedule(yr)
-        except Exception:
-            continue
-        match = sched[sched["Location"].str.lower() == circuit_key.lower()]
-        for _, ev in match.iterrows():
-            try:
-                sess = fastf1.get_session(yr, int(ev["RoundNumber"]), "Race")
-                sess.load(laps=False, telemetry=False, weather=False, messages=False)
-                res = sess.results[["Abbreviation", "GridPosition", "Position", "Status"]].copy()
-                res["Year"] = yr
-                rows.append(res)
-            except Exception:
-                continue
-    if not rows:
-        return None
-    df = pd.concat(rows, ignore_index=True)
-    df = df.rename(columns={"Abbreviation": "Driver", "GridPosition": "Grid",
-                            "Position": "Finish"})
-    df["Grid"] = pd.to_numeric(df["Grid"], errors="coerce")
-    df["Finish"] = pd.to_numeric(df["Finish"], errors="coerce")
-    # pit-lane starters show as grid 0; treat as last on the grid
-    df.loc[df["Grid"] == 0, "Grid"] = df["Grid"].max()
-    # keep classified finishers only so crashes do not distort the averages
-    df = df[df["Status"].astype(str).str.contains(r"Finished|\+\d+ Lap|Lapped", regex=True, na=False)]
-    return df.dropna(subset=["Grid", "Finish"])
-
-
-def grid_history_table(hist):
-    if hist is None or hist.empty:
-        return None
-    t = hist.groupby("Grid").agg(
-        Races=("Finish", "count"),
-        AvgFinish=("Finish", "mean"),
-        MedianFinish=("Finish", "median"),
-    ).reset_index()
-    t["PlacesGained"] = t["Grid"] - t["AvgFinish"]
-    return t.round(2)
-
-
-def circuit_grid_weight(hist):
-    """Higher correlation between grid and finish = grid matters more here."""
-    if hist is None or len(hist) < 40:
-        return GRID_WEIGHT_DEFAULT, None
-    corr = hist["Grid"].corr(hist["Finish"], method="spearman")
-    if pd.isna(corr):
-        return GRID_WEIGHT_DEFAULT, None
-    # map correlation 0.3 -> min weight, 0.9 -> max weight
-    scaled = (corr - 0.3) / (0.9 - 0.3)
-    weight = GRID_WEIGHT_MIN + max(0.0, min(1.0, scaled)) * (GRID_WEIGHT_MAX - GRID_WEIGHT_MIN)
-    return float(weight), float(corr)
-
-
 def quali_projection(session_laps):
     rows = []
     for name, laps in session_laps.items():
@@ -383,12 +322,16 @@ st.title("🏁 F1 Podium Predictor")
 
 st.sidebar.title("⚙️ Settings")
 this_year = datetime.now().year
-year = int(st.sidebar.selectbox("Season", list(range(this_year, HISTORY_START_YEAR - 1, -1))))
+year = int(st.sidebar.selectbox("Season", list(range(this_year, FIRST_SEASON - 1, -1))))
 events, default_idx = selectable_events(year)
 labels = [f"R{int(r.RoundNumber)} – {r.EventName}" for r in events.itertuples()]
 pick = st.sidebar.selectbox("Track", range(len(labels)), index=default_idx,
                             format_func=lambda i: labels[i])
 event = events.iloc[pick]
+grid_weight = st.sidebar.slider(
+    "Grid position weight", 0, 60, GRID_WEIGHT_DEFAULT, step=5, format="%d%%",
+    help="How much the projected qualifying position counts in the race prediction. "
+         "0% means race prediction uses practice long-run pace only.") / 100
 if st.sidebar.button("🔄 Refresh data"):
     st.cache_data.clear()
     st.rerun()
@@ -430,11 +373,6 @@ if not available:
     st.stop()
 st.info("Practice sessions loaded: " + ", ".join(available))
 
-with st.spinner(f"Loading {circuit} race history since {HISTORY_START_YEAR}..."):
-    history = load_race_history(circuit, year - 1)
-grid_weight, grid_corr = circuit_grid_weight(history)
-hist_table = grid_history_table(history)
-
 quali = quali_projection(session_laps)
 pace = long_run_pace(session_laps)
 race = race_projection(quali, pace, grid_weight) if quali is not None else None
@@ -443,7 +381,7 @@ actual = load_actual_results(year, round_number, event)
 if race is not None and actual is not None:
     race = race.merge(actual, on="Driver", how="left")
 
-tab1, tab2, tab3, tab4 = st.tabs(["🏆 Podium", "⏱️ Qualifying", "🏎️ Race", "📈 History"])
+tab1, tab2, tab3 = st.tabs(["🏆 Podium", "⏱️ Qualifying", "🏎️ Race"])
 
 with tab1:
     if race is None or race.empty:
@@ -454,7 +392,7 @@ with tab1:
         medals = ["🥇 P1", "🥈 P2", "🥉 P3"]
         for c, m, (_, r) in zip(cols, medals, top3.iterrows()):
             c.metric(m, r["Driver"], r["Team"], delta_color="off")
-        st.caption(f"Predicted podium. Grid position weight at {circuit}: {grid_weight:.0%}")
+        st.caption(f"Predicted podium. Grid position weight: {grid_weight:.0%}")
         if actual is not None:
             st.markdown("**Actual podium**")
             real = actual.sort_values("ActualFinish").head(3)
@@ -502,24 +440,4 @@ with tab3:
         fig.update_traces(textposition="top center")
         st.plotly_chart(fig, use_container_width=True)
 
-with tab4:
-    st.subheader(f"{circuit}: finishing position by grid slot, {HISTORY_START_YEAR} onward")
-    if hist_table is None:
-        st.write("No completed races at this circuit since 2021, so the default grid weight is used.")
-    else:
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Races in sample", int(history["Year"].nunique()))
-        c2.metric("Grid-to-finish correlation", f"{grid_corr:.2f}" if grid_corr is not None else "n/a")
-        c3.metric("Grid weight used", f"{grid_weight:.0%}")
-        shown = hist_table.rename(columns={
-            "Grid": "Grid slot", "AvgFinish": "Avg finish",
-            "MedianFinish": "Median finish", "PlacesGained": "Places gained"})
-        st.dataframe(shown, hide_index=True, use_container_width=True)
-        fig = px.line(hist_table, x="Grid", y="AvgFinish", markers=True,
-                      title="Average finishing position by starting slot")
-        fig.add_scatter(x=hist_table["Grid"], y=hist_table["Grid"], mode="lines",
-                        name="No change", line=dict(dash="dash"))
-        st.plotly_chart(fig, use_container_width=True)
-        st.caption("Classified finishers only. Points below the dashed line mean drivers from that slot tend to gain places.")
-
-st.caption("Built from FastF1 data. Projections are estimates, not guarantees.")
+st.caption("Built from FastF1 and OpenF1 data. Projections are estimates, not guarantees.")
