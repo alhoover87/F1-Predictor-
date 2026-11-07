@@ -524,6 +524,13 @@ fp_pick = st.sidebar.radio("Practice data to use", list(FP_CHOICES.keys()), inde
                            help="Only the selected sessions feed the qualifying and race projections.")
 selected_fp = FP_CHOICES[fp_pick]
 
+st.sidebar.markdown("**Tyre compounds to use**")
+tc1, tc2, tc3 = st.sidebar.columns(3)
+use_soft = tc1.checkbox("Soft", value=True)
+use_med = tc2.checkbox("Medium", value=True)
+use_hard = tc3.checkbox("Hard", value=True)
+selected_compounds = {c for c, on in (("SOFT", use_soft), ("MEDIUM", use_med), ("HARD", use_hard)) if on}
+
 grid_weight = st.sidebar.slider(
     "Grid position weight", 0, 60, GRID_WEIGHT_DEFAULT, step=5, format="%d%%",
     help="How much the projected qualifying position counts in the race prediction. "
@@ -569,6 +576,21 @@ if not available:
         st.code(f"{short}: {err}")
     st.stop()
 st.info("Practice sessions used: " + ", ".join(available))
+
+if not selected_compounds:
+    st.warning("Pick at least one tyre compound in Settings.")
+    st.stop()
+# keep only laps on the chosen compounds
+session_laps = {
+    k: (v[v["Compound"].astype(str).str.upper().isin(selected_compounds)] if v is not None else None)
+    for k, v in session_laps.items()
+}
+if all(v is None or v.empty for v in session_laps.values()):
+    st.warning("No laps on the selected tyre compounds in these sessions. Try adding another compound.")
+    st.stop()
+if len(selected_compounds) < 3:
+    st.caption("Using only " + ", ".join(c.title() for c in ("SOFT", "MEDIUM", "HARD")
+                                         if c in selected_compounds) + " tyre laps.")
 
 runs = _stint_runs(session_laps)
 compound_offsets, compound_source, session_shift = estimate_compound_offsets(runs)
