@@ -8,7 +8,7 @@ import logging
 import time
 from datetime import datetime
 
-st.set_page_config(page_title="Podium Predictor", page_icon="🏆", layout="wide")
+st.set_page_config(page_title="F1 Podium Predictor", page_icon="🏆", layout="wide")
 fastf1.Cache.enable_cache("/tmp")
 
 QUALI_WEIGHTS = {"FP1": 0.20, "FP2": 0.35, "FP3": 0.45}
@@ -217,6 +217,77 @@ def load_session_result(year, round_number, event, session_name, done_after_hour
     return None
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def _grid_fastf1(year, round_number):
+    """Official grid as the race actually started (only exists after the race)."""
+    sess = fastf1.get_session(year, round_number, "Race")
+    sess.load(laps=False, telemetry=False, weather=False, messages=False)
+    res = sess.results[["Abbreviation", "GridPosition"]].copy()
+    res["GridPosition"] = pd.to_numeric(res["GridPosition"], errors="coerce")
+    res = res.dropna(subset=["GridPosition"])
+    if res.empty or (res["GridPosition"] == 0).all():
+        raise ValueError("No grid in race results yet")
+    # 0 means a pit-lane start: put those drivers at the back
+    back = int(res["GridPosition"].max()) + 1
+    res.loc[res["GridPosition"] == 0, "GridPosition"] = back
+    res = res.sort_values("GridPosition").reset_index(drop=True)
+    res["Position"] = range(1, len(res) + 1)
+    return res.rename(columns={"Abbreviation": "Driver"})[["Driver", "Position"]]
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _grid_openf1(year, race_date_utc):
+    """FIA starting grid with penalties applied, published before the race."""
+    sessions = _openf1_get("sessions", year=year, session_name="Race")
+    if not sessions:
+        raise ValueError("No races on OpenF1")
+    target = pd.Timestamp(race_date_utc)
+    target = target.tz_localize("UTC") if target.tzinfo is None else target.tz_convert("UTC")
+    race = min(sessions, key=lambda x: abs(pd.Timestamp(x["date_start"]).tz_convert("UTC") - target))
+    if abs(pd.Timestamp(race["date_start"]).tz_convert("UTC") - target) > pd.Timedelta(days=2):
+        raise ValueError("Race not found on OpenF1")
+    grid = []
+    for params in ({"meeting_key": race["meeting_key"]}, {"session_key": race["session_key"]}):
+        try:
+            grid = _openf1_get("starting_grid", **params)
+        except Exception:
+            grid = []
+        if grid:
+            break
+        time.sleep(0.4)
+    if not grid:
+        raise ValueError("Starting grid not published yet")
+    g = pd.DataFrame(grid)
+    if "session_key" in g.columns and g["session_key"].nunique() > 1:
+        g = g[g["session_key"] == g["session_key"].max()]
+    time.sleep(0.4)
+    drivers = pd.DataFrame(_openf1_get("drivers", session_key=g["session_key"].iloc[0]))
+    drivers = drivers.drop_duplicates("driver_number")[["driver_number", "name_acronym"]]
+    g = g.merge(drivers, on="driver_number", how="left")
+    g["Position"] = pd.to_numeric(g["position"], errors="coerce")
+    g = g.dropna(subset=["Position", "name_acronym"]).sort_values("Position")
+    return g.rename(columns={"name_acronym": "Driver"})[["Driver", "Position"]].reset_index(drop=True)
+
+
+def load_starting_grid(year, round_number, event):
+    """Official starting grid including FIA grid penalties, or None if not out yet."""
+    race_date = session_date_for(event, "Race")
+    if race_date is None:
+        return None
+    rd = race_date.tz_localize("UTC") if race_date.tzinfo is None else race_date.tz_convert("UTC")
+    now = pd.Timestamp.now(tz="UTC")
+    loaders = []
+    if rd + pd.Timedelta(hours=3) < now:
+        loaders.append(lambda: _grid_fastf1(year, round_number))
+    loaders.append(lambda: _grid_openf1(year, race_date.isoformat()))
+    for loader in loaders:
+        try:
+            return loader()
+        except Exception:
+            continue
+    return None
+
+
 def session_date_for(event, session_name):
     for i in range(1, 6):
         if event.get(f"Session{i}") == session_name:
@@ -307,13 +378,13 @@ def long_run_pace(session_laps):
     return agg
 
 
-def race_projection(quali, pace, grid_weight, actual_quali=None):
-    """Blends long-run pace with grid position. Uses the real qualifying
-    order once it exists, otherwise the projected one."""
+def race_projection(quali, pace, grid_weight, known_grid=None):
+    """Blends long-run pace with grid position. Uses the best grid available:
+    official starting grid (with penalties) > real qualifying > projected."""
     if pace is None:
         return None
-    if actual_quali is not None:
-        grid = actual_quali.rename(columns={"Position": "ProjectedGrid"})[["Driver", "ProjectedGrid"]]
+    if known_grid is not None:
+        grid = known_grid.rename(columns={"Position": "ProjectedGrid"})[["Driver", "ProjectedGrid"]]
     elif quali is not None:
         grid = quali[["Driver", "ProjectedGrid"]]
     else:
@@ -350,7 +421,7 @@ LOGO_SVG = """
 st.markdown(
     f"""<div style="display:flex;align-items:center;gap:14px;margin:0 0 0.5rem 0;">
         {LOGO_SVG}
-        <span style="font-size:2.4rem;font-weight:800;line-height:1.1;">Podium Predictor</span>
+        <span style="font-size:2.4rem;font-weight:800;line-height:1.1;">F1 Podium Predictor</span>
     </div>""",
     unsafe_allow_html=True,
 )
@@ -424,7 +495,22 @@ st.info("Practice sessions used: " + ", ".join(available))
 quali = quali_projection(session_laps)
 pace = long_run_pace(session_laps)
 actual_quali = load_session_result(year, round_number, event, "Qualifying", 1.5)
-race = race_projection(quali, pace, grid_weight, actual_quali)
+official_grid = load_starting_grid(year, round_number, event) if actual_quali is not None else None
+known_grid = official_grid if official_grid is not None else actual_quali
+race = race_projection(quali, pace, grid_weight, known_grid)
+
+# drivers whose start slot differs from where they qualified (penalties, pit-lane starts)
+grid_changes = None
+if official_grid is not None and actual_quali is not None:
+    gc = actual_quali.rename(columns={"Position": "Qualified"}).merge(
+        official_grid.rename(columns={"Position": "Starts"}), on="Driver", how="inner")
+    gc = gc[gc["Qualified"] != gc["Starts"]].copy()
+    if not gc.empty:
+        gc["Qualified"] = gc["Qualified"].astype(int)
+        gc["Starts"] = gc["Starts"].astype(int)
+        gc["Change"] = gc["Starts"] - gc["Qualified"]
+        gc = gc[gc["Change"] > 0]  # only penalised drivers; others just move up behind them
+        grid_changes = gc.sort_values("Change", ascending=False) if not gc.empty else None
 
 actual = load_session_result(year, round_number, event, "Race", 3)
 if actual is not None:
@@ -432,9 +518,16 @@ if actual is not None:
 if race is not None and actual is not None:
     race = race.merge(actual, on="Driver", how="left")
 
-grid_label = "Grid (actual quali)" if actual_quali is not None else "Projected grid"
-if actual_quali is not None:
-    st.success("Qualifying is done, so the race prediction uses the real qualifying order.")
+if official_grid is not None:
+    grid_label = "Grid (official, with penalties)"
+    st.success("The official starting grid is out, so the race prediction uses it, "
+               "including any FIA grid penalties.")
+elif actual_quali is not None:
+    grid_label = "Grid (actual quali)"
+    st.success("Qualifying is done, so the race prediction uses the real qualifying order. "
+               "It will switch to the official grid, with penalties, once the FIA publishes it.")
+else:
+    grid_label = "Projected grid"
 
 tab1, tab2, tab3 = st.tabs(["🏆 Podium", "⏱️ Qualifying", "🏎️ Race"])
 
@@ -514,6 +607,13 @@ with tab3:
                                     "DegPerLap": "Tyre deg (s/lap)",
                                     "LongRunLaps": "Long-run laps"})
         st.dataframe(show, hide_index=True, use_container_width=True)
+        if grid_changes is not None:
+            st.markdown("**Grid penalties** (drivers starting behind where they qualified)")
+            gshow = grid_changes.copy()
+            gshow["Change"] = gshow["Change"].map(lambda x: f"{x} place{'s' if x != 1 else ''} back")
+            st.dataframe(gshow, hide_index=True, use_container_width=True)
+        elif official_grid is not None:
+            st.caption("Official grid matches qualifying, no penalties applied.")
         fig = px.scatter(race, x="RaceGapPct", y="DegPerLap", text="Driver",
                          color="Team", title="Long-run pace vs tyre degradation")
         fig.update_traces(textposition="top center")
