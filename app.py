@@ -15,6 +15,12 @@ QUALI_WEIGHTS = {"FP1": 0.20, "FP2": 0.35, "FP3": 0.45}
 FIRST_SEASON = 2021
 GRID_WEIGHT_DEFAULT = 25  # percent; adjustable in the sidebar
 
+# Typical lap-time difference vs the medium tyre, in seconds per lap.
+# Used only when a weekend doesn't have enough mixed-compound runs to measure it.
+COMPOUND_DEFAULTS = {"SOFT": -0.5, "MEDIUM": 0.0, "HARD": 0.4}
+COMPOUND_LIMITS = {"SOFT": (-1.2, -0.1), "HARD": (0.1, 1.2)}
+DRY_COMPOUNDS = set(COMPOUND_DEFAULTS)
+
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_schedule(year):
@@ -315,43 +321,16 @@ def load_session_laps(year, round_number, session_name, event):
     return None, None, " || ".join(errors)
 
 
-def quali_projection(session_laps):
-    rows = []
-    for name, laps in session_laps.items():
-        if laps is None or laps.empty:
-            continue
-        best = (laps.dropna(subset=["LapSeconds"])
-                .groupby(["Driver", "Team"])["LapSeconds"].min().reset_index())
-        fastest = best["LapSeconds"].min()
-        best["GapPct"] = (best["LapSeconds"] - fastest) / fastest * 100
-        best["Session"] = name
-        rows.append(best)
-    if not rows:
-        return None
-    allbest = pd.concat(rows)
-    pivot = allbest.pivot_table(index=["Driver", "Team"], columns="Session",
-                                values="GapPct").reset_index()
-    score = pd.Series(0.0, index=pivot.index)
-    total_w = pd.Series(0.0, index=pivot.index)
-    for s, w in QUALI_WEIGHTS.items():
-        if s in pivot.columns:
-            has = pivot[s].notna()
-            score[has] += pivot.loc[has, s] * w
-            total_w[has] += w
-    pivot["QualiScore"] = score / total_w.replace(0, np.nan)
-    pivot = pivot.dropna(subset=["QualiScore"]).sort_values("QualiScore").reset_index(drop=True)
-    pivot["ProjectedGrid"] = range(1, len(pivot) + 1)
-    return pivot
-
-
-def long_run_pace(session_laps):
+def _stint_runs(session_laps):
+    """Every clean long run, with pace corrected to 5-lap-old tyres."""
     rows = []
     for name, laps in session_laps.items():
         if laps is None or laps.empty:
             continue
         clean = laps[(laps["IsAccurate"] == True) & laps["LapSeconds"].notna()
                      & laps["PitInTime"].isna() & laps["PitOutTime"].isna()
-                     & laps["TyreLife"].notna()]
+                     & laps["TyreLife"].notna()
+                     & laps["Compound"].astype(str).str.upper().isin(DRY_COMPOUNDS)]
         for (drv, team, stint), grp in clean.groupby(["Driver", "Team", "Stint"]):
             if len(grp) < 5:
                 continue
@@ -363,16 +342,115 @@ def long_run_pace(session_laps):
             slope = max(min(slope, 0.2), -0.05)
             avg_age = grp["TyreLife"].mean()
             corrected = grp["LapSeconds"].mean() - slope * (avg_age - 5)
-            rows.append({"Driver": drv, "Team": team, "Session": name,
-                         "Laps": len(grp), "Compound": grp["Compound"].mode().iloc[0],
+            rows.append({"Driver": drv, "Team": team, "Session": name, "Laps": len(grp),
+                         "Compound": str(grp["Compound"].mode().iloc[0]).upper(),
                          "Pace": corrected, "DegPerLap": slope})
+    return pd.DataFrame(rows)
+
+
+def estimate_compound_offsets(runs):
+    """Learns soft/hard deltas vs medium, and how much faster the track got from
+    session to session, from this weekend's long runs. Fits
+    pace = driver + session + compound with least squares, so a driver's own runs
+    on different tyres (or in different sessions) are what reveal the gaps.
+    Compounds without at least 2 drivers running them alongside another compound
+    use the typical defaults instead."""
+    offsets = dict(COMPOUND_DEFAULTS)
+    source = {c: "typical" for c in COMPOUND_DEFAULTS}
+    source["MEDIUM"] = "reference"
+    session_shift = {}
+    if runs is None or runs.empty:
+        return offsets, source, session_shift
+
+    per_driver = runs.groupby("Driver")["Compound"].nunique()
+    mixed = set(per_driver[per_driver > 1].index)
+    measurable = [c for c in ("SOFT", "HARD")
+                  if runs[(runs["Compound"] == c) & runs["Driver"].isin(mixed)]["Driver"].nunique() >= 2]
+
+    df = runs.copy()
+    # pre-correct compounds we can't measure, then fit the rest
+    fixed = df["Compound"].map(lambda c: 0.0 if c in measurable else COMPOUND_DEFAULTS.get(c, 0.0))
+    y = (df["Pace"] - fixed).to_numpy()
+    drivers = sorted(df["Driver"].unique())
+    sessions = sorted(df["Session"].unique())
+    X = []
+    for _, r in df.iterrows():
+        row = [1.0 if r["Driver"] == d else 0.0 for d in drivers]
+        row += [1.0 if r["Session"] == s_ else 0.0 for s_ in sessions[1:]]
+        row += [1.0 if r["Compound"] == c else 0.0 for c in measurable]
+        X.append(row)
+    X = np.array(X)
+    if X.shape[1] == len(drivers):  # one session and nothing to measure
+        return offsets, source, session_shift
+    w = np.sqrt(df["Laps"].to_numpy(dtype=float))  # longer runs count more
+    coef, *_ = np.linalg.lstsq(X * w[:, None], y * w, rcond=None)
+
+    k = len(drivers)
+    # only trust a session shift if enough drivers did long runs in both sessions
+    first_drivers = set(df[df["Session"] == sessions[0]]["Driver"])
+    for i, s_ in enumerate(sessions[1:]):
+        shared = first_drivers & set(df[df["Session"] == s_]["Driver"])
+        if len(shared) >= 3:
+            session_shift[s_] = float(min(max(coef[k + i], -2.0), 2.0))
+    k += len(sessions) - 1
+    for i, c in enumerate(measurable):
+        lo, hi = COMPOUND_LIMITS[c]
+        offsets[c] = float(min(max(coef[k + i], lo), hi))
+        source[c] = "measured"
+    return offsets, source, session_shift
+
+
+def _medium_equivalent(laps, offsets):
+    comp = laps["Compound"].astype(str).str.upper()
+    return laps["LapSeconds"] - comp.map(offsets).fillna(0.0)
+
+
+def quali_projection(session_laps, offsets):
+    rows = []
+    for name, laps in session_laps.items():
+        if laps is None or laps.empty:
+            continue
+        dry = laps[laps["Compound"].astype(str).str.upper().isin(DRY_COMPOUNDS)
+                   & laps["LapSeconds"].notna()].copy()
+        if dry.empty:
+            continue
+        dry["AdjSeconds"] = _medium_equivalent(dry, offsets)
+        best = dry.loc[dry.groupby("Driver")["AdjSeconds"].idxmin(),
+                       ["Driver", "Team", "AdjSeconds", "Compound"]]
+        fastest = best["AdjSeconds"].min()
+        best["GapPct"] = (best["AdjSeconds"] - fastest) / fastest * 100
+        best["Session"] = name
+        rows.append(best)
     if not rows:
         return None
-    runs = pd.DataFrame(rows)
+    allbest = pd.concat(rows)
+    pivot = allbest.pivot_table(index=["Driver", "Team"], columns="Session",
+                                values="GapPct").reset_index()
+    score = pd.Series(0.0, index=pivot.index)
+    total_w = pd.Series(0.0, index=pivot.index)
+    for s_, w in QUALI_WEIGHTS.items():
+        if s_ in pivot.columns:
+            has = pivot[s_].notna()
+            score[has] += pivot.loc[has, s_] * w
+            total_w[has] += w
+    pivot["QualiScore"] = score / total_w.replace(0, np.nan)
+    pivot = pivot.dropna(subset=["QualiScore"]).sort_values("QualiScore").reset_index(drop=True)
+    pivot["ProjectedGrid"] = range(1, len(pivot) + 1)
+    return pivot
+
+
+def long_run_pace(runs, offsets, session_shift=None):
+    if runs is None or runs.empty:
+        return None
+    runs = runs.copy()
+    runs["Pace"] = runs["Pace"] - runs["Compound"].map(offsets).fillna(0.0)
+    if session_shift:
+        runs["Pace"] = runs["Pace"] - runs["Session"].map(session_shift).fillna(0.0)
     best_runs = runs.sort_values("Laps", ascending=False).groupby("Driver").head(2)
     agg = best_runs.groupby(["Driver", "Team"]).agg(
         RacePace=("Pace", "mean"), DegPerLap=("DegPerLap", "mean"),
-        LongRunLaps=("Laps", "sum")).reset_index()
+        LongRunLaps=("Laps", "sum"),
+        Tyres=("Compound", lambda x: "/".join(sorted(set(x))))).reset_index()
     fastest = agg["RacePace"].min()
     agg["RaceGapPct"] = (agg["RacePace"] - fastest) / fastest * 100
     return agg
@@ -492,8 +570,10 @@ if not available:
     st.stop()
 st.info("Practice sessions used: " + ", ".join(available))
 
-quali = quali_projection(session_laps)
-pace = long_run_pace(session_laps)
+runs = _stint_runs(session_laps)
+compound_offsets, compound_source, session_shift = estimate_compound_offsets(runs)
+quali = quali_projection(session_laps, compound_offsets)
+pace = long_run_pace(runs, compound_offsets, session_shift)
 actual_quali = load_session_result(year, round_number, event, "Qualifying", 1.5)
 official_grid = load_starting_grid(year, round_number, event) if actual_quali is not None else None
 known_grid = official_grid if official_grid is not None else actual_quali
@@ -583,6 +663,7 @@ with tab2:
         show["QualiScore"] = show["QualiScore"].round(3)
         show = show.rename(columns={"QualiScore": "Avg gap to best (%)"})
         st.dataframe(show, hide_index=True, use_container_width=True)
+        st.caption("Gaps are tyre-adjusted to medium-equivalent lap times (see Race tab for the values).")
         fig = px.bar(quali, x="Driver", y="QualiScore", color="Team",
                      title="Projected qualifying gap to fastest (%)")
         st.plotly_chart(fig, use_container_width=True)
@@ -594,7 +675,7 @@ with tab3:
         cols_shown = ["ProjectedFinish", "Driver", "Team", "ProjectedGrid"]
         if "ActualFinish" in race.columns:
             cols_shown.append("ActualFinish")
-        cols_shown += ["RaceGapPct", "DegPerLap", "LongRunLaps"]
+        cols_shown += ["RaceGapPct", "DegPerLap", "LongRunLaps", "Tyres"]
         show = race[cols_shown].copy()
         if "ActualFinish" in show.columns:
             show["ActualFinish"] = show["ActualFinish"].astype("Int64")
@@ -607,6 +688,17 @@ with tab3:
                                     "DegPerLap": "Tyre deg (s/lap)",
                                     "LongRunLaps": "Long-run laps"})
         st.dataframe(show, hide_index=True, use_container_width=True)
+        with st.expander("Tyre compound adjustment"):
+            st.write("All lap times are converted to medium-tyre equivalents before comparing.")
+            st.dataframe(pd.DataFrame([
+                {"Compound": c.title(), "Seconds vs medium": f"{compound_offsets[c]:+.2f}",
+                 "Source": compound_source[c]} for c in ("SOFT", "MEDIUM", "HARD")]),
+                hide_index=True, use_container_width=True)
+            st.caption("Measured = learned from drivers who ran more than one compound this weekend. "
+                       "Typical = not enough data, so a standard value is used.")
+            if session_shift:
+                st.write("Track evolution correction (long runs, vs the first session used): " +
+                         ", ".join(f"{k} {v:+.2f}s" for k, v in session_shift.items()))
         if grid_changes is not None:
             st.markdown("**Grid penalties** (drivers starting behind where they qualified)")
             gshow = grid_changes.copy()
