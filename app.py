@@ -165,54 +165,56 @@ def _load_openf1_laps(year, session_name, session_date_utc):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _actual_results_fastf1(year, round_number):
-    sess = fastf1.get_session(year, round_number, "Race")
+def _result_fastf1(year, round_number, session_name):
+    sess = fastf1.get_session(year, round_number, session_name)
     sess.load(laps=False, telemetry=False, weather=False, messages=False)
     res = sess.results[["Abbreviation", "Position"]].copy()
     res["Position"] = pd.to_numeric(res["Position"], errors="coerce")
     res = res.dropna(subset=["Position"])
     if res.empty:
-        raise ValueError("No race results yet")
-    return res.rename(columns={"Abbreviation": "Driver", "Position": "ActualFinish"})
+        raise ValueError(f"No {session_name} results yet")
+    return res.rename(columns={"Abbreviation": "Driver"})[["Driver", "Position"]]
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _actual_results_openf1(year, race_date_utc):
-    sessions = _openf1_get("sessions", year=year, session_name="Race")
-    target = pd.Timestamp(race_date_utc)
+def _result_openf1(year, session_name, session_date_utc):
+    sessions = _openf1_get("sessions", year=year, session_name=session_name)
+    if not sessions:
+        raise ValueError(f"No {session_name} sessions on OpenF1")
+    target = pd.Timestamp(session_date_utc)
     target = target.tz_localize("UTC") if target.tzinfo is None else target.tz_convert("UTC")
     best = min(sessions, key=lambda x: abs(pd.Timestamp(x["date_start"]).tz_convert("UTC") - target))
     if abs(pd.Timestamp(best["date_start"]).tz_convert("UTC") - target) > pd.Timedelta(days=2):
-        raise ValueError("Race not found on OpenF1")
+        raise ValueError(f"{session_name} not found on OpenF1")
     key = best["session_key"]
     res = pd.DataFrame(_openf1_get("session_result", session_key=key))
     time.sleep(0.4)
     drivers = pd.DataFrame(_openf1_get("drivers", session_key=key))
     if res.empty:
-        raise ValueError("No race results yet")
+        raise ValueError(f"No {session_name} results yet")
     drivers = drivers.drop_duplicates("driver_number")[["driver_number", "name_acronym"]]
     res = res.merge(drivers, on="driver_number", how="left")
-    res["ActualFinish"] = pd.to_numeric(res["position"], errors="coerce")
-    res = res.dropna(subset=["ActualFinish"])
-    return res.rename(columns={"name_acronym": "Driver"})[["Driver", "ActualFinish"]]
+    res["Position"] = pd.to_numeric(res["position"], errors="coerce")
+    res = res.dropna(subset=["Position"])
+    return res.rename(columns={"name_acronym": "Driver"})[["Driver", "Position"]]
 
 
-def load_actual_results(year, round_number, event):
-    """Real race result for a completed race, or None. Tries FastF1 then OpenF1."""
-    race_date = session_date_for(event, "Race")
-    if race_date is None:
+def load_session_result(year, round_number, event, session_name, done_after_hours):
+    """Real classification for a finished session, or None. Tries FastF1 then OpenF1."""
+    sdate = session_date_for(event, session_name)
+    if sdate is None:
         return None
-    rd = race_date.tz_localize("UTC") if race_date.tzinfo is None else race_date.tz_convert("UTC")
-    if rd + pd.Timedelta(hours=3) > pd.Timestamp.now(tz="UTC"):
-        return None  # race not finished yet
-    try:
-        return _actual_results_fastf1(year, round_number)
-    except Exception:
-        pass
-    try:
-        return _actual_results_openf1(year, race_date.isoformat())
-    except Exception:
-        return None
+    sd = sdate.tz_localize("UTC") if sdate.tzinfo is None else sdate.tz_convert("UTC")
+    if sd + pd.Timedelta(hours=done_after_hours) > pd.Timestamp.now(tz="UTC"):
+        return None  # session not finished yet
+    for loader in (lambda: _result_fastf1(year, round_number, session_name),
+                   lambda: _result_openf1(year, session_name, sdate.isoformat())):
+        try:
+            res = loader()
+            return res.sort_values("Position").reset_index(drop=True)
+        except Exception:
+            continue
+    return None
 
 
 def session_date_for(event, session_name):
@@ -305,10 +307,20 @@ def long_run_pace(session_laps):
     return agg
 
 
-def race_projection(quali, pace, grid_weight):
+def race_projection(quali, pace, grid_weight, actual_quali=None):
+    """Blends long-run pace with grid position. Uses the real qualifying
+    order once it exists, otherwise the projected one."""
     if pace is None:
         return None
-    df = pace.merge(quali[["Driver", "ProjectedGrid"]], on="Driver", how="left")
+    if actual_quali is not None:
+        grid = actual_quali.rename(columns={"Position": "ProjectedGrid"})[["Driver", "ProjectedGrid"]]
+    elif quali is not None:
+        grid = quali[["Driver", "ProjectedGrid"]]
+    else:
+        grid = pd.DataFrame({"Driver": pace["Driver"], "ProjectedGrid": np.nan})
+    df = pace.merge(grid, on="Driver", how="left")
+    if df["ProjectedGrid"].isna().all():
+        df["ProjectedGrid"] = len(df)
     df["ProjectedGrid"] = df["ProjectedGrid"].fillna(df["ProjectedGrid"].max() + 1)
     pace_rank = df["RaceGapPct"].rank()
     df["RaceScore"] = (1 - grid_weight) * pace_rank + grid_weight * df["ProjectedGrid"]
@@ -388,11 +400,18 @@ st.info("Practice sessions used: " + ", ".join(available))
 
 quali = quali_projection(session_laps)
 pace = long_run_pace(session_laps)
-race = race_projection(quali, pace, grid_weight) if quali is not None else None
+actual_quali = load_session_result(year, round_number, event, "Qualifying", 1.5)
+race = race_projection(quali, pace, grid_weight, actual_quali)
 
-actual = load_actual_results(year, round_number, event)
+actual = load_session_result(year, round_number, event, "Race", 3)
+if actual is not None:
+    actual = actual.rename(columns={"Position": "ActualFinish"})
 if race is not None and actual is not None:
     race = race.merge(actual, on="Driver", how="left")
+
+grid_label = "Grid (actual quali)" if actual_quali is not None else "Projected grid"
+if actual_quali is not None:
+    st.success("Qualifying is done, so the race prediction uses the real qualifying order.")
 
 tab1, tab2, tab3 = st.tabs(["🏆 Podium", "⏱️ Qualifying", "🏎️ Race"])
 
@@ -419,7 +438,29 @@ with tab1:
             st.success(f"{hits} of 3 podium drivers predicted, {exact} in the exact position.")
 
 with tab2:
-    if quali is None:
+    if actual_quali is not None:
+        st.markdown("**Actual qualifying result**")
+        aq = actual_quali.copy()
+        aq["Position"] = aq["Position"].astype(int)
+        if quali is not None:
+            aq = aq.merge(quali[["Driver", "Team", "ProjectedGrid"]], on="Driver", how="left")
+            aq["Off by"] = (aq["ProjectedGrid"] - aq["Position"]).abs().astype("Int64")
+            aq["ProjectedGrid"] = aq["ProjectedGrid"].astype("Int64")
+            aq = aq.rename(columns={"ProjectedGrid": "Predicted"})
+            pred_top3 = set(quali.head(3)["Driver"])
+            hits = len(pred_top3 & set(aq.head(3)["Driver"]))
+            pole_ok = (not quali.empty) and quali.iloc[0]["Driver"] == aq.iloc[0]["Driver"]
+            st.caption(f"Pole {'predicted ✓' if pole_ok else 'missed'} · "
+                       f"{hits} of 3 front-runners predicted")
+        st.dataframe(aq.rename(columns={"Position": "Actual"}), hide_index=True,
+                     use_container_width=True)
+        if quali is not None:
+            with st.expander("Show the practice-based projection"):
+                show = quali[["ProjectedGrid", "Driver", "Team", "QualiScore"]].copy()
+                show["QualiScore"] = show["QualiScore"].round(3)
+                st.dataframe(show.rename(columns={"QualiScore": "Avg gap to best (%)"}),
+                             hide_index=True, use_container_width=True)
+    elif quali is None:
         st.write("No qualifying projection available.")
     else:
         show = quali[["ProjectedGrid", "Driver", "Team", "QualiScore"]].copy()
@@ -442,6 +483,8 @@ with tab3:
         if "ActualFinish" in show.columns:
             show["ActualFinish"] = show["ActualFinish"].astype("Int64")
             show = show.rename(columns={"ActualFinish": "Actual finish"})
+        show["ProjectedGrid"] = show["ProjectedGrid"].astype("Int64")
+        show = show.rename(columns={"ProjectedGrid": grid_label})
         show["RaceGapPct"] = show["RaceGapPct"].round(3)
         show["DegPerLap"] = show["DegPerLap"].round(3)
         show = show.rename(columns={"RaceGapPct": "Long-run gap (%)",
