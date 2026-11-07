@@ -321,8 +321,8 @@ def load_session_laps(year, round_number, session_name, event):
     return None, None, " || ".join(errors)
 
 
-def _stint_runs(session_laps):
-    """Every clean long run, with pace corrected to 5-lap-old tyres."""
+def _stint_runs(session_laps, min_laps=5):
+    """Every clean run of at least min_laps laps, with pace corrected to 5-lap-old tyres."""
     rows = []
     for name, laps in session_laps.items():
         if laps is None or laps.empty:
@@ -332,11 +332,11 @@ def _stint_runs(session_laps):
                      & laps["TyreLife"].notna()
                      & laps["Compound"].astype(str).str.upper().isin(DRY_COMPOUNDS)]
         for (drv, team, stint), grp in clean.groupby(["Driver", "Team", "Stint"]):
-            if len(grp) < 5:
+            if len(grp) < min_laps:
                 continue
             med = grp["LapSeconds"].median()
             grp = grp[grp["LapSeconds"] < med * 1.03]
-            if len(grp) < 5:
+            if len(grp) < min_laps:
                 continue
             slope = np.polyfit(grp["TyreLife"].astype(float), grp["LapSeconds"], 1)[0]
             slope = max(min(slope, 0.2), -0.05)
@@ -531,6 +531,11 @@ use_med = tc2.checkbox("Medium", value=True)
 use_hard = tc3.checkbox("Hard", value=True)
 selected_compounds = {c for c, on in (("SOFT", use_soft), ("MEDIUM", use_med), ("HARD", use_hard)) if on}
 
+min_long_run = st.sidebar.slider(
+    "Minimum long-run length (laps)", 3, 15, 5,
+    help="A run on one set of tyres needs at least this many clean laps to count as a long run. "
+         "Higher = closer to race conditions but fewer drivers qualify.")
+
 grid_weight = st.sidebar.slider(
     "Grid position weight", 0, 60, GRID_WEIGHT_DEFAULT, step=5, format="%d%%",
     help="How much the projected qualifying position counts in the race prediction. "
@@ -592,7 +597,7 @@ if len(selected_compounds) < 3:
     st.caption("Using only " + ", ".join(c.title() for c in ("SOFT", "MEDIUM", "HARD")
                                          if c in selected_compounds) + " tyre laps.")
 
-runs = _stint_runs(session_laps)
+runs = _stint_runs(session_laps, min_long_run)
 compound_offsets, compound_source, session_shift = estimate_compound_offsets(runs)
 quali = quali_projection(session_laps, compound_offsets)
 pace = long_run_pace(runs, compound_offsets, session_shift)
@@ -635,7 +640,7 @@ tab1, tab2, tab3 = st.tabs(["🏆 Podium", "⏱️ Qualifying", "🏎️ Race"])
 
 with tab1:
     if race is None or race.empty:
-        st.write("Not enough long-run data yet to project the race.")
+        st.write(f"No long runs of {min_long_run}+ laps found yet. Try lowering the minimum long-run length in Settings.")
     else:
         top3 = race.head(3)
         cols = st.columns(3)
@@ -692,7 +697,7 @@ with tab2:
 
 with tab3:
     if race is None or race.empty:
-        st.write("No race projection available yet.")
+        st.write(f"No long runs of {min_long_run}+ laps found. Try lowering the minimum long-run length in Settings.")
     else:
         cols_shown = ["ProjectedFinish", "Driver", "Team", "ProjectedGrid"]
         if "ActualFinish" in race.columns:
