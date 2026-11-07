@@ -3,6 +3,9 @@ import fastf1
 import pandas as pd
 import numpy as np
 import plotly.express as px
+import requests
+import logging
+import time
 from datetime import datetime
 
 st.set_page_config(page_title="F1 Podium Predictor", page_icon="🏁", layout="wide")
@@ -31,26 +34,144 @@ def next_event(year):
     return upcoming.iloc[0]
 
 
+LAP_COLUMNS = ["Driver", "Team", "LapTime", "LapNumber", "Stint", "Compound",
+               "TyreLife", "IsAccurate", "PitInTime", "PitOutTime", "LapSeconds"]
+
+
+class _LogCapture(logging.Handler):
+    """Collects FastF1's warning/error log lines, which it logs instead of raising."""
+    def __init__(self):
+        super().__init__(level=logging.WARNING)
+        self.lines = []
+
+    def emit(self, record):
+        self.lines.append(record.getMessage())
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
-def _load_session_laps_cached(year, round_number, session_name):
+def _load_fastf1_laps(year, round_number, session_name):
     # Raises on failure, so failures are NOT cached and get retried next time
-    session = fastf1.get_session(year, round_number, session_name)
-    session.load(laps=True, telemetry=False, weather=False, messages=False)
-    laps = session.laps.copy()
-    if laps is None or laps.empty:
-        raise ValueError("Session loaded but contains no laps yet")
-    laps = laps[["Driver", "Team", "LapTime", "LapNumber", "Stint",
-                 "Compound", "TyreLife", "IsAccurate", "PitInTime", "PitOutTime"]]
-    laps["LapSeconds"] = laps["LapTime"].dt.total_seconds()
-    return laps
-
-
-def load_session_laps(year, round_number, session_name):
-    """Returns (laps, error_message)."""
+    cap = _LogCapture()
+    logger = logging.getLogger("fastf1")
+    logger.addHandler(cap)
     try:
-        return _load_session_laps_cached(year, round_number, session_name), None
+        session = fastf1.get_session(year, round_number, session_name)
+        session.load(laps=True, telemetry=False, weather=False, messages=False)
+        try:
+            laps = session.laps.copy()
+        except Exception as e:
+            detail = " | ".join(cap.lines[-3:]) or str(e)
+            raise RuntimeError(f"FastF1 could not get timing data ({detail})")
+    finally:
+        logger.removeHandler(cap)
+    if laps is None or laps.empty:
+        raise ValueError("FastF1 loaded the session but it has no laps yet")
+    laps["LapSeconds"] = laps["LapTime"].dt.total_seconds()
+    return laps[LAP_COLUMNS]
+
+
+OPENF1 = "https://api.openf1.org/v1"
+
+
+def _openf1_get(endpoint, **params):
+    for attempt in range(3):
+        r = requests.get(f"{OPENF1}/{endpoint}", params=params, timeout=30)
+        if r.status_code == 429:  # rate limited, back off and retry
+            time.sleep(1.5 * (attempt + 1))
+            continue
+        r.raise_for_status()
+        return r.json()
+    raise RuntimeError(f"OpenF1 rate limit on {endpoint}")
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _load_openf1_laps(year, session_name, session_date_utc):
+    """Backup source. Finds the session by name and date, then builds the same
+    lap table FastF1 would give us."""
+    sessions = _openf1_get("sessions", year=year, session_name=session_name)
+    if not sessions:
+        raise ValueError(f"OpenF1 has no '{session_name}' sessions for {year}")
+    target = pd.Timestamp(session_date_utc)
+    target = target.tz_localize("UTC") if target.tzinfo is None else target.tz_convert("UTC")
+    best = min(sessions, key=lambda x: abs(pd.Timestamp(x["date_start"]).tz_convert("UTC") - target))
+    if abs(pd.Timestamp(best["date_start"]).tz_convert("UTC") - target) > pd.Timedelta(days=2):
+        raise ValueError("OpenF1 has not published this session yet")
+    key = best["session_key"]
+
+    laps = pd.DataFrame(_openf1_get("laps", session_key=key))
+    time.sleep(0.4)
+    stints = pd.DataFrame(_openf1_get("stints", session_key=key))
+    time.sleep(0.4)
+    drivers = pd.DataFrame(_openf1_get("drivers", session_key=key))
+    if laps.empty:
+        raise ValueError("OpenF1 found the session but it has no laps yet")
+
+    drivers = drivers.drop_duplicates("driver_number")[["driver_number", "name_acronym", "team_name"]]
+    laps = laps.merge(drivers, on="driver_number", how="left")
+
+    laps["Stint"] = np.nan
+    laps["Compound"] = None
+    laps["TyreLife"] = np.nan
+    laps["PitInTime"] = np.nan
+    if not stints.empty:
+        for _, stn in stints.iterrows():
+            if pd.isna(stn.get("lap_start")) or pd.isna(stn.get("lap_end")):
+                continue
+            m = ((laps["driver_number"] == stn["driver_number"])
+                 & (laps["lap_number"] >= stn["lap_start"])
+                 & (laps["lap_number"] <= stn["lap_end"]))
+            laps.loc[m, "Stint"] = stn["stint_number"]
+            laps.loc[m, "Compound"] = stn.get("compound")
+            age0 = stn.get("tyre_age_at_start") or 0
+            laps.loc[m, "TyreLife"] = age0 + (laps.loc[m, "lap_number"] - stn["lap_start"]) + 1
+            # last lap of a stint is the in-lap to the pits
+            laps.loc[(laps["driver_number"] == stn["driver_number"])
+                     & (laps["lap_number"] == stn["lap_end"]), "PitInTime"] = 1
+
+    out = pd.DataFrame({
+        "Driver": laps["name_acronym"].fillna(laps["driver_number"].astype(str)),
+        "Team": laps["team_name"].fillna("Unknown"),
+        "LapNumber": laps["lap_number"],
+        "Stint": laps["Stint"],
+        "Compound": laps["Compound"],
+        "TyreLife": laps["TyreLife"],
+        "PitInTime": laps["PitInTime"],
+        "PitOutTime": np.where(laps.get("is_pit_out_lap", False) == True, 1, np.nan),
+        "LapSeconds": pd.to_numeric(laps["lap_duration"], errors="coerce"),
+    })
+    out["LapTime"] = pd.to_timedelta(out["LapSeconds"], unit="s")
+    out["IsAccurate"] = out["LapSeconds"].notna() & out["PitOutTime"].isna()
+    out = out.dropna(subset=["LapSeconds"])
+    if out.empty:
+        raise ValueError("OpenF1 laps have no lap times yet")
+    return out[LAP_COLUMNS]
+
+
+def session_date_for(event, session_name):
+    for i in range(1, 6):
+        if event.get(f"Session{i}") == session_name:
+            for col in (f"Session{i}DateUtc", f"Session{i}Date"):
+                if col in event.index and pd.notna(event[col]):
+                    return pd.Timestamp(event[col])
+    return None
+
+
+def load_session_laps(year, round_number, session_name, event):
+    """Returns (laps, source, error_message). Tries FastF1, then OpenF1."""
+    errors = []
+    try:
+        return _load_fastf1_laps(year, round_number, session_name), "FastF1", None
     except Exception as e:
-        return None, f"{type(e).__name__}: {e}"
+        errors.append(f"FastF1 - {type(e).__name__}: {e}")
+    sdate = session_date_for(event, session_name)
+    if sdate is None:
+        errors.append("OpenF1 - this weekend has no such session (sprint weekend?)")
+        return None, None, " || ".join(errors)
+    try:
+        return _load_openf1_laps(year, session_name, sdate.isoformat()), "OpenF1", None
+    except Exception as e:
+        errors.append(f"OpenF1 - {type(e).__name__}: {e}")
+    return None, None, " || ".join(errors)
 
 
 # ---------- Per-circuit history (2021 onward) ----------
@@ -203,12 +324,15 @@ st.caption(f"{circuit}, {event['Country']}")
 sess_map = {"FP1": "Practice 1", "FP2": "Practice 2", "FP3": "Practice 3"}
 session_laps = {}
 load_errors = {}
+sources = {}
 with st.spinner("Loading practice data..."):
     for short, full in sess_map.items():
-        laps, err = load_session_laps(year, round_number, full)
+        laps, src, err = load_session_laps(year, round_number, full, event)
         session_laps[short] = laps
         if err:
             load_errors[short] = err
+        else:
+            sources[short] = src
 
 available = [k for k, v in session_laps.items() if v is not None and not v.empty]
 
@@ -219,7 +343,7 @@ with st.sidebar.expander("Diagnostics", expanded=not available):
         if short in load_errors:
             st.error(f"{short}: {load_errors[short]}")
         else:
-            st.success(f"{short}: {len(session_laps[short])} laps")
+            st.success(f"{short}: {len(session_laps[short])} laps from {sources[short]}")
 
 if not available:
     st.warning("No practice data loaded. Open Diagnostics in the sidebar to see why, "
