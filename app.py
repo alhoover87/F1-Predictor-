@@ -32,17 +32,25 @@ def next_event(year):
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
+def _load_session_laps_cached(year, round_number, session_name):
+    # Raises on failure, so failures are NOT cached and get retried next time
+    session = fastf1.get_session(year, round_number, session_name)
+    session.load(laps=True, telemetry=False, weather=False, messages=False)
+    laps = session.laps.copy()
+    if laps is None or laps.empty:
+        raise ValueError("Session loaded but contains no laps yet")
+    laps = laps[["Driver", "Team", "LapTime", "LapNumber", "Stint",
+                 "Compound", "TyreLife", "IsAccurate", "PitInTime", "PitOutTime"]]
+    laps["LapSeconds"] = laps["LapTime"].dt.total_seconds()
+    return laps
+
+
 def load_session_laps(year, round_number, session_name):
+    """Returns (laps, error_message)."""
     try:
-        session = fastf1.get_session(year, round_number, session_name)
-        session.load(telemetry=False, weather=False, messages=False)
-        laps = session.laps.copy()
-        laps = laps[["Driver", "Team", "LapTime", "LapNumber", "Stint",
-                     "Compound", "TyreLife", "IsAccurate", "PitInTime", "PitOutTime"]]
-        laps["LapSeconds"] = laps["LapTime"].dt.total_seconds()
-        return laps
-    except Exception:
-        return None
+        return _load_session_laps_cached(year, round_number, session_name), None
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
 
 
 # ---------- Per-circuit history (2021 onward) ----------
@@ -181,6 +189,9 @@ def race_projection(quali, pace, grid_weight):
 
 # ---------- UI ----------
 st.title("🏁 F1 Podium Predictor")
+if st.sidebar.button("🔄 Refresh data"):
+    st.cache_data.clear()
+    st.rerun()
 this_year = datetime.now().year
 year = int(st.sidebar.number_input("Season", 2021, this_year, this_year))
 event = next_event(year)
@@ -191,13 +202,30 @@ st.caption(f"{circuit}, {event['Country']}")
 
 sess_map = {"FP1": "Practice 1", "FP2": "Practice 2", "FP3": "Practice 3"}
 session_laps = {}
+load_errors = {}
 with st.spinner("Loading practice data..."):
     for short, full in sess_map.items():
-        session_laps[short] = load_session_laps(year, round_number, full)
+        laps, err = load_session_laps(year, round_number, full)
+        session_laps[short] = laps
+        if err:
+            load_errors[short] = err
 
 available = [k for k, v in session_laps.items() if v is not None and not v.empty]
+
+with st.sidebar.expander("Diagnostics", expanded=not available):
+    st.write(f"FastF1 version: {fastf1.__version__}")
+    st.write(f"Event picked: {event['EventName']} (round {round_number})")
+    for short in sess_map:
+        if short in load_errors:
+            st.error(f"{short}: {load_errors[short]}")
+        else:
+            st.success(f"{short}: {len(session_laps[short])} laps")
+
 if not available:
-    st.warning("No practice data is available yet for this weekend. Check back after FP1.")
+    st.warning("No practice data loaded. Open Diagnostics in the sidebar to see why, "
+               "then tap Refresh data to try again.")
+    for short, err in load_errors.items():
+        st.code(f"{short}: {err}")
     st.stop()
 st.info("Practice sessions loaded: " + ", ".join(available))
 
