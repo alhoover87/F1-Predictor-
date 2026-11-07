@@ -328,6 +328,18 @@ labels = [f"R{int(r.RoundNumber)} – {r.EventName}" for r in events.itertuples(
 pick = st.sidebar.selectbox("Track", range(len(labels)), index=default_idx,
                             format_func=lambda i: labels[i])
 event = events.iloc[pick]
+FP_CHOICES = {
+    "All sessions (FP1 + FP2 + FP3)": ["FP1", "FP2", "FP3"],
+    "FP1 only": ["FP1"],
+    "FP2 only": ["FP2"],
+    "FP3 only": ["FP3"],
+    "FP1 + FP2": ["FP1", "FP2"],
+    "FP2 + FP3": ["FP2", "FP3"],
+}
+fp_pick = st.sidebar.radio("Practice data to use", list(FP_CHOICES.keys()), index=0,
+                           help="Only the selected sessions feed the qualifying and race projections.")
+selected_fp = FP_CHOICES[fp_pick]
+
 grid_weight = st.sidebar.slider(
     "Grid position weight", 0, 60, GRID_WEIGHT_DEFAULT, step=5, format="%d%%",
     help="How much the projected qualifying position counts in the race prediction. "
@@ -341,7 +353,8 @@ circuit = event["Location"]
 st.subheader(f"{event['EventName']} – {year}, Round {round_number}")
 st.caption(f"{circuit}, {event['Country']}")
 
-sess_map = {"FP1": "Practice 1", "FP2": "Practice 2", "FP3": "Practice 3"}
+ALL_FP = {"FP1": "Practice 1", "FP2": "Practice 2", "FP3": "Practice 3"}
+sess_map = {k: v for k, v in ALL_FP.items() if k in selected_fp}
 session_laps = {}
 load_errors = {}
 sources = {}
@@ -371,7 +384,7 @@ if not available:
     for short, err in load_errors.items():
         st.code(f"{short}: {err}")
     st.stop()
-st.info("Practice sessions loaded: " + ", ".join(available))
+st.info("Practice sessions used: " + ", ".join(available))
 
 quali = quali_projection(session_laps)
 pace = long_run_pace(session_laps)
