@@ -23,6 +23,25 @@ def get_schedule(year):
     return fastf1.get_event_schedule(year, include_testing=False)
 
 
+def selectable_events(year):
+    """Every round that has started, plus the next upcoming one.
+    Returns (schedule rows, index of the default pick)."""
+    sched = get_schedule(year)
+    sched = sched[sched["RoundNumber"] > 0].reset_index(drop=True)
+    start_col = "Session1DateUtc" if "Session1DateUtc" in sched.columns else "EventDate"
+    end_col = "Session5DateUtc" if "Session5DateUtc" in sched.columns else "EventDate"
+    starts = pd.to_datetime(sched[start_col], utc=True, errors="coerce")
+    ends = pd.to_datetime(sched[end_col], utc=True, errors="coerce")
+    now = pd.Timestamp.now(tz="UTC")
+    upcoming = sched.index[ends >= now]
+    if len(upcoming) == 0:          # season over: show all, default to the finale
+        return sched, len(sched) - 1
+    nxt = upcoming[0]
+    started = sched.index[starts <= now]
+    last = max(nxt, started.max() if len(started) else nxt)
+    return sched.loc[:last], int(nxt)
+
+
 def next_event(year):
     sched = get_schedule(year)
     date_col = "Session5DateUtc" if "Session5DateUtc" in sched.columns else "EventDate"
@@ -145,6 +164,57 @@ def _load_openf1_laps(year, session_name, session_date_utc):
     if out.empty:
         raise ValueError("OpenF1 laps have no lap times yet")
     return out[LAP_COLUMNS]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _actual_results_fastf1(year, round_number):
+    sess = fastf1.get_session(year, round_number, "Race")
+    sess.load(laps=False, telemetry=False, weather=False, messages=False)
+    res = sess.results[["Abbreviation", "Position"]].copy()
+    res["Position"] = pd.to_numeric(res["Position"], errors="coerce")
+    res = res.dropna(subset=["Position"])
+    if res.empty:
+        raise ValueError("No race results yet")
+    return res.rename(columns={"Abbreviation": "Driver", "Position": "ActualFinish"})
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _actual_results_openf1(year, race_date_utc):
+    sessions = _openf1_get("sessions", year=year, session_name="Race")
+    target = pd.Timestamp(race_date_utc)
+    target = target.tz_localize("UTC") if target.tzinfo is None else target.tz_convert("UTC")
+    best = min(sessions, key=lambda x: abs(pd.Timestamp(x["date_start"]).tz_convert("UTC") - target))
+    if abs(pd.Timestamp(best["date_start"]).tz_convert("UTC") - target) > pd.Timedelta(days=2):
+        raise ValueError("Race not found on OpenF1")
+    key = best["session_key"]
+    res = pd.DataFrame(_openf1_get("session_result", session_key=key))
+    time.sleep(0.4)
+    drivers = pd.DataFrame(_openf1_get("drivers", session_key=key))
+    if res.empty:
+        raise ValueError("No race results yet")
+    drivers = drivers.drop_duplicates("driver_number")[["driver_number", "name_acronym"]]
+    res = res.merge(drivers, on="driver_number", how="left")
+    res["ActualFinish"] = pd.to_numeric(res["position"], errors="coerce")
+    res = res.dropna(subset=["ActualFinish"])
+    return res.rename(columns={"name_acronym": "Driver"})[["Driver", "ActualFinish"]]
+
+
+def load_actual_results(year, round_number, event):
+    """Real race result for a completed race, or None. Tries FastF1 then OpenF1."""
+    race_date = session_date_for(event, "Race")
+    if race_date is None:
+        return None
+    rd = race_date.tz_localize("UTC") if race_date.tzinfo is None else race_date.tz_convert("UTC")
+    if rd + pd.Timedelta(hours=3) > pd.Timestamp.now(tz="UTC"):
+        return None  # race not finished yet
+    try:
+        return _actual_results_fastf1(year, round_number)
+    except Exception:
+        pass
+    try:
+        return _actual_results_openf1(year, race_date.isoformat())
+    except Exception:
+        return None
 
 
 def session_date_for(event, session_name):
@@ -310,15 +380,22 @@ def race_projection(quali, pace, grid_weight):
 
 # ---------- UI ----------
 st.title("🏁 F1 Podium Predictor")
+
+st.sidebar.title("⚙️ Settings")
+this_year = datetime.now().year
+year = int(st.sidebar.selectbox("Season", list(range(this_year, HISTORY_START_YEAR - 1, -1))))
+events, default_idx = selectable_events(year)
+labels = [f"R{int(r.RoundNumber)} – {r.EventName}" for r in events.itertuples()]
+pick = st.sidebar.selectbox("Track", range(len(labels)), index=default_idx,
+                            format_func=lambda i: labels[i])
+event = events.iloc[pick]
 if st.sidebar.button("🔄 Refresh data"):
     st.cache_data.clear()
     st.rerun()
-this_year = datetime.now().year
-year = int(st.sidebar.number_input("Season", 2021, this_year, this_year))
-event = next_event(year)
+
 round_number = int(event["RoundNumber"])
 circuit = event["Location"]
-st.subheader(f"{event['EventName']} – Round {round_number}")
+st.subheader(f"{event['EventName']} – {year}, Round {round_number}")
 st.caption(f"{circuit}, {event['Country']}")
 
 sess_map = {"FP1": "Practice 1", "FP2": "Practice 2", "FP3": "Practice 3"}
@@ -346,8 +423,8 @@ with st.sidebar.expander("Diagnostics", expanded=not available):
             st.success(f"{short}: {len(session_laps[short])} laps from {sources[short]}")
 
 if not available:
-    st.warning("No practice data loaded. Open Diagnostics in the sidebar to see why, "
-               "then tap Refresh data to try again.")
+    st.warning("No practice data loaded for this race. Open Diagnostics in the sidebar "
+               "to see why, then tap Refresh data to try again. Note OpenF1 only covers 2023 onward.")
     for short, err in load_errors.items():
         st.code(f"{short}: {err}")
     st.stop()
@@ -362,6 +439,10 @@ quali = quali_projection(session_laps)
 pace = long_run_pace(session_laps)
 race = race_projection(quali, pace, grid_weight) if quali is not None else None
 
+actual = load_actual_results(year, round_number, event)
+if race is not None and actual is not None:
+    race = race.merge(actual, on="Driver", how="left")
+
 tab1, tab2, tab3, tab4 = st.tabs(["🏆 Podium", "⏱️ Qualifying", "🏎️ Race", "📈 History"])
 
 with tab1:
@@ -373,7 +454,18 @@ with tab1:
         medals = ["🥇 P1", "🥈 P2", "🥉 P3"]
         for c, m, (_, r) in zip(cols, medals, top3.iterrows()):
             c.metric(m, r["Driver"], r["Team"], delta_color="off")
-        st.caption(f"Grid position weight at {circuit}: {grid_weight:.0%}")
+        st.caption(f"Predicted podium. Grid position weight at {circuit}: {grid_weight:.0%}")
+        if actual is not None:
+            st.markdown("**Actual podium**")
+            real = actual.sort_values("ActualFinish").head(3)
+            acols = st.columns(3)
+            pred3 = set(top3["Driver"])
+            for c, m, (_, r) in zip(acols, medals, real.iterrows()):
+                c.metric(m, r["Driver"], "✓ predicted" if r["Driver"] in pred3 else "missed",
+                         delta_color="normal" if r["Driver"] in pred3 else "inverse")
+            hits = len(pred3 & set(real["Driver"]))
+            exact = sum(a == b for a, b in zip(top3["Driver"], real["Driver"]))
+            st.success(f"{hits} of 3 podium drivers predicted, {exact} in the exact position.")
 
 with tab2:
     if quali is None:
@@ -391,8 +483,14 @@ with tab3:
     if race is None or race.empty:
         st.write("No race projection available yet.")
     else:
-        show = race[["ProjectedFinish", "Driver", "Team", "ProjectedGrid",
-                     "RaceGapPct", "DegPerLap", "LongRunLaps"]].copy()
+        cols_shown = ["ProjectedFinish", "Driver", "Team", "ProjectedGrid"]
+        if "ActualFinish" in race.columns:
+            cols_shown.append("ActualFinish")
+        cols_shown += ["RaceGapPct", "DegPerLap", "LongRunLaps"]
+        show = race[cols_shown].copy()
+        if "ActualFinish" in show.columns:
+            show["ActualFinish"] = show["ActualFinish"].astype("Int64")
+            show = show.rename(columns={"ActualFinish": "Actual finish"})
         show["RaceGapPct"] = show["RaceGapPct"].round(3)
         show["DegPerLap"] = show["DegPerLap"].round(3)
         show = show.rename(columns={"RaceGapPct": "Long-run gap (%)",
