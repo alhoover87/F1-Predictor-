@@ -1118,6 +1118,122 @@ def set_track_background(event, year):
     </style>""", unsafe_allow_html=True)
 
 
+# ---------- Track photo background (Wikimedia Commons, free licences only) ----------
+COMMONS_API = "https://commons.wikimedia.org/w/api.php"
+CIRCUIT_NAMES = [  # (keywords in location/event name, circuit name used for the image search)
+    (("sakhir", "bahrain"), "Bahrain International Circuit"),
+    (("jeddah", "saudi"), "Jeddah Corniche Circuit"),
+    (("melbourne", "australia"), "Albert Park Circuit"),
+    (("suzuka", "japan"), "Suzuka Circuit"),
+    (("shanghai", "chin"), "Shanghai International Circuit"),
+    (("miami",), "Miami International Autodrome"),
+    (("imola", "emilia"), "Autodromo Enzo e Dino Ferrari Imola"),
+    (("monaco", "monte carlo"), "Circuit de Monaco"),
+    (("montr", "canad"), "Circuit Gilles Villeneuve"),
+    (("barcelona", "catalunya", "spanish"), "Circuit de Barcelona-Catalunya"),
+    (("madrid",), "Madring Madrid circuit"),
+    (("spielberg", "austria"), "Red Bull Ring"),
+    (("silverstone", "british"), "Silverstone Circuit"),
+    (("budapest", "hungar"), "Hungaroring"),
+    (("spa-francorchamps", "belgi"), "Circuit de Spa-Francorchamps"),
+    (("zandvoort", "dutch"), "Circuit Zandvoort"),
+    (("monza", "italian"), "Autodromo Nazionale Monza"),
+    (("baku", "azerbaijan"), "Baku City Circuit"),
+    (("marina bay", "singapore"), "Marina Bay Street Circuit"),
+    (("austin", "united states", "cota"), "Circuit of the Americas"),
+    (("mexico",), "Autódromo Hermanos Rodríguez"),
+    (("paulo", "interlagos", "brazil"), "Autódromo José Carlos Pace Interlagos"),
+    (("las vegas",), "Las Vegas Strip Circuit"),
+    (("lusail", "qatar"), "Lusail International Circuit"),
+    (("yas", "abu dhabi"), "Yas Marina Circuit"),
+]
+AERIAL_WORDS = ("aerial", "aérien", "aerea", "aérea", "luftbild", "luftaufnahme", "satellite", "from above",
+                "bird", "overhead", "vue du ciel", "drone", "view from", "sentinel", "landsat")
+FREE_LICENCE_WORDS = ("cc0", "public domain", "cc by", "cc-by", "pd-")
+
+
+def circuit_name_for(event):
+    text = f"{event.get('Location', '')} {event.get('EventName', '')} {event.get('Country', '')}".lower()
+    for keys, name in CIRCUIT_NAMES:
+        if any(k in text for k in keys):
+            return name
+    return f"{event.get('Location', '')} circuit"
+
+
+@st.cache_data(ttl=7 * 86400, show_spinner=False)
+def commons_aerial_image(circuit_name, location):
+    """Finds a freely licensed aerial/satellite photo of the circuit on Wikimedia Commons.
+    Only CC0, public-domain and CC BY / CC BY-SA images are accepted (no NC or ND terms),
+    so the photo can be shown with a credit. Returns a dict (url, title, artist, licence,
+    page) or None if nothing suitable turns up."""
+    queries = [f"{circuit_name} aerial", f"{circuit_name} satellite", f"{circuit_name} luftbild",
+               f"{location} circuit aerial view"]
+    headers = {"User-Agent": "F1PodiumPredictor/1.0 (Streamlit app; contact via GitHub)"}
+    best, best_score = None, 0
+    for q in queries:
+        params = {"action": "query", "format": "json", "generator": "search",
+                  "gsrsearch": f"{q} filetype:bitmap", "gsrnamespace": 6, "gsrlimit": 15,
+                  "prop": "imageinfo", "iiprop": "url|extmetadata|size", "iiurlwidth": 1600}
+        try:
+            r = requests.get(COMMONS_API, params=params, timeout=20, headers=headers)
+            r.raise_for_status()
+            pages = r.json().get("query", {}).get("pages", {})
+        except Exception:
+            continue
+        for pg in pages.values():
+            info = (pg.get("imageinfo") or [{}])[0]
+            meta = info.get("extmetadata", {}) or {}
+            licence = str(meta.get("LicenseShortName", {}).get("value", "")).strip()
+            lic = licence.lower()
+            if not any(w in lic for w in FREE_LICENCE_WORDS) or "-nc" in lic or "-nd" in lic or " nc" in lic:
+                continue
+            w, h = info.get("width", 0) or 0, info.get("height", 0) or 0
+            if w < 900 or h < 500:
+                continue
+            title = str(pg.get("title", "")).replace("File:", "")
+            desc = re.sub(r"<[^>]+>", " ", str(meta.get("ImageDescription", {}).get("value", "")))
+            text = f"{title} {desc}".lower()
+            hits = sum(1 for word in AERIAL_WORDS if word in text)
+            if hits == 0:
+                continue  # trackside photos and maps don't count
+            score = hits * 10 + (5 if w > h else 0) + min(w, 4000) / 1000
+            if score > best_score:
+                artist = re.sub(r"<[^>]+>", " ", str(meta.get("Artist", {}).get("value", ""))).strip()
+                artist = re.sub(r"\s+", " ", artist)[:80]
+                best_score = score
+                best = {"url": info.get("thumburl") or info.get("url"), "title": title, "artist": artist,
+                        "licence": licence, "page": info.get("descriptionurl", "")}
+        if best and best_score >= 20:
+            break
+    return best
+
+
+def set_track_photo_background(photo):
+    """Aerial photo behind the main panel at 10% strength: a 90% white wash sits over it so
+    the tables and charts stay readable."""
+    if not photo or not photo.get("url"):
+        return False
+    st.markdown(f"""<style>
+    [data-testid="stMain"], section.main {{
+        background-image: linear-gradient(rgba(255,255,255,0.90), rgba(255,255,255,0.90)),
+                          url("{photo['url']}");
+        background-repeat: no-repeat;
+        background-position: center center;
+        background-size: cover;
+        background-attachment: scroll;
+    }}
+    </style>""", unsafe_allow_html=True)
+    return True
+
+
+def photo_credit(photo):
+    if not photo:
+        return ""
+    who = f" by {photo['artist']}" if photo.get("artist") else ""
+    link = f"[{photo['title']}]({photo['page']})" if photo.get("page") else photo["title"]
+    return f"Background: {link}{who}, {photo['licence']}, via Wikimedia Commons."
+
+
 def team_colour_map(session_laps):
     """Team -> '#rrggbb' using the colours F1 live timing publishes."""
     frames = [v[["Team", "TeamColor"]] for v in session_laps.values()
@@ -1530,6 +1646,9 @@ with st.sidebar.expander("Model tuning", expanded=False):
         "Track evolution correction", True,
         help="Corrects every lap to end-of-session grip, so a quick lap set early in a session "
              "isn't punished for a green track.")
+show_photo = st.sidebar.checkbox("Track photo background", True,
+                                 help="A free-licence aerial photo of the circuit from Wikimedia Commons, "
+                                      "shown faintly behind the page. Falls back to the track outline.")
 if st.sidebar.button("🔄 Refresh data"):
     st.cache_data.clear()
     st.rerun()
@@ -1540,7 +1659,14 @@ settings = {"fp": selected_fp, "compounds": selected_compounds, "min_laps": min_
             "evolution": use_evolution, "deg_weight": deg_weight,
             "wet_quali": wet_mode, "wet_discount": wet_discount, "legacy": False}
 
-set_track_background(event, year)
+track_photo = None
+if show_photo:
+    try:
+        track_photo = commons_aerial_image(circuit_name_for(event), str(event["Location"]))
+    except Exception:
+        track_photo = None
+if not set_track_photo_background(track_photo):
+    set_track_background(event, year)
 circuit = event["Location"]
 st.subheader(f"{event['EventName']} – {year}, Round {round_number}")
 st.caption(f"{circuit}, {event['Country']}")
@@ -2147,4 +2273,6 @@ with tab5:
             time.sleep(5)
             st.rerun()
 
-st.caption("Built from FastF1 and OpenF1 data. Projections are estimates, not guarantees.")
+credit = photo_credit(track_photo)
+st.caption("Built from FastF1 and OpenF1 data. Projections are estimates, not guarantees."
+           + (f" {credit}" if credit else ""))
