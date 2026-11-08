@@ -1981,4 +1981,48 @@ with tab5:
                                         "Podium exact": rs["Top3Exact"], "R avg error": rs["MAE"],
                                         "R correlation": rs["Spearman"]})
                         if not qs and not rs:
-                            row["Note"]
+                            row["Note"] = "no data"
+                    except Exception as e:
+                        row["Note"] = f"{type(e).__name__}: {e}"
+                    rows.append(row)
+                prog.progress((i + 1) / n_test)
+            status.empty()
+            st.session_state["backtest"] = pd.DataFrame(rows)
+            st.session_state["backtest_year"] = year
+
+        bt = st.session_state.get("backtest")
+        if bt is not None and st.session_state.get("backtest_year") == year and not bt.empty:
+            summary_rows = []
+            for label_, g in bt.groupby("Model", sort=False):
+                def pct(col):
+                    return f"{g[col].mean() * 100:.0f}%" if col in g.columns and g[col].notna().any() else "–"
+
+                def avg(col, nd=2):
+                    return round(g[col].mean(), nd) if col in g.columns and g[col].notna().any() else "–"
+                summary_rows.append({
+                    "Model": label_,
+                    "Races": int(g["Pole"].notna().sum()) if "Pole" in g.columns else 0,
+                    "Pole right": pct("Pole"), "Quali top-3 hits (of 3)": avg("Q top3 hits"),
+                    "Quali avg error (places)": avg("Q avg error", 1),
+                    "Winner right": pct("Winner"), "Podium hits (of 3)": avg("Podium hits"),
+                    "Podium exact (of 3)": avg("Podium exact"),
+                    "Race avg error (places)": avg("R avg error", 1),
+                    "Race correlation": avg("R correlation"),
+                })
+            st.markdown("**Summary**")
+            show_table(pd.DataFrame(summary_rows))
+            st.caption("Correlation runs from -1 to 1; 1 means the predicted order matched the result exactly. "
+                       "Avg error is how many places each driver was off, on average.")
+            st.markdown("**Race by race**")
+            detail = bt.copy()
+            for col in ("Pole", "Winner"):
+                if col in detail.columns:
+                    detail[col] = detail[col].map({True: "✓", False: "✗"})
+            for col in ("Q avg error", "R avg error", "Q correlation", "R correlation"):
+                if col in detail.columns:
+                    detail[col] = detail[col].round(2)
+            show_table(detail.drop(columns=["Round"]).fillna("–"))
+            st.caption("If the previous model scores better on several races, lower the recent form weight "
+                       "or turn off the team correction in Settings and run again.")
+
+st.caption("Built from FastF1 and OpenF1 data. Projections are estimates, not guarantees.")
