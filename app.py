@@ -5,6 +5,10 @@ import numpy as np
 import plotly.express as px
 import requests
 import json
+import re
+import html as htmllib
+import unicodedata
+import xml.etree.ElementTree as ET
 from pathlib import Path
 import logging
 import time
@@ -60,7 +64,7 @@ def next_event(year):
 
 
 LAP_COLUMNS = ["Driver", "Team", "LapTime", "LapNumber", "Stint", "Compound",
-               "TyreLife", "IsAccurate", "PitInTime", "PitOutTime", "LapSeconds"]
+               "TyreLife", "IsAccurate", "PitInTime", "PitOutTime", "LapSeconds", "TeamColor"]
 
 
 class _LogCapture(logging.Handler):
@@ -92,6 +96,12 @@ def _load_fastf1_laps(year, round_number, session_name):
     if laps is None or laps.empty:
         raise ValueError("FastF1 loaded the session but it has no laps yet")
     laps["LapSeconds"] = laps["LapTime"].dt.total_seconds()
+    laps["TeamColor"] = np.nan
+    try:  # official live-timing team colour
+        colours = session.results[["Abbreviation", "TeamColor"]].dropna()
+        laps["TeamColor"] = laps["Driver"].map(dict(zip(colours["Abbreviation"], colours["TeamColor"])))
+    except Exception:
+        pass
     return laps[LAP_COLUMNS]
 
 
@@ -131,7 +141,9 @@ def _load_openf1_laps(year, session_name, session_date_utc):
     if laps.empty:
         raise ValueError("OpenF1 found the session but it has no laps yet")
 
-    drivers = drivers.drop_duplicates("driver_number")[["driver_number", "name_acronym", "team_name"]]
+    if "team_colour" not in drivers.columns:
+        drivers["team_colour"] = np.nan
+    drivers = drivers.drop_duplicates("driver_number")[["driver_number", "name_acronym", "team_name", "team_colour"]]
     laps = laps.merge(drivers, on="driver_number", how="left")
 
     laps["Stint"] = np.nan
@@ -156,6 +168,7 @@ def _load_openf1_laps(year, session_name, session_date_utc):
     out = pd.DataFrame({
         "Driver": laps["name_acronym"].fillna(laps["driver_number"].astype(str)),
         "Team": laps["team_name"].fillna("Unknown"),
+        "TeamColor": laps["team_colour"],
         "LapNumber": laps["lap_number"],
         "Stint": laps["Stint"],
         "Compound": laps["Compound"],
@@ -324,8 +337,10 @@ def load_session_laps(year, round_number, session_name, event):
 
 
 def _stint_runs(session_laps, min_laps=5):
-    """Every clean run of at least min_laps laps, with pace corrected to 5-lap-old tyres."""
+    """Every clean run of at least min_laps laps, with pace corrected to 5-lap-old tyres.
+    Returns (one row per run, one row per lap of those runs)."""
     rows = []
+    lap_rows = []
     for name, laps in session_laps.items():
         if laps is None or laps.empty:
             continue
@@ -344,10 +359,18 @@ def _stint_runs(session_laps, min_laps=5):
             slope = max(min(slope, 0.2), -0.05)
             avg_age = grp["TyreLife"].mean()
             corrected = grp["LapSeconds"].mean() - slope * (avg_age - 5)
+            compound = str(grp["Compound"].mode().iloc[0]).upper()
             rows.append({"Driver": drv, "Team": team, "Session": name, "Laps": len(grp),
-                         "Compound": str(grp["Compound"].mode().iloc[0]).upper(),
-                         "Pace": corrected, "DegPerLap": slope})
-    return pd.DataFrame(rows)
+                         "Compound": compound, "Pace": corrected, "DegPerLap": slope})
+            g = grp.sort_values("LapNumber")[["Driver", "Team", "LapNumber", "TyreLife", "LapSeconds"]].copy()
+            g["Session"] = name
+            g["Stint"] = stint
+            g["Compound"] = compound
+            g["RunLap"] = range(1, len(g) + 1)
+            g["Run"] = f"{drv} {name} {compound.title()}"
+            lap_rows.append(g)
+    runlaps = pd.concat(lap_rows, ignore_index=True) if lap_rows else pd.DataFrame()
+    return pd.DataFrame(rows), runlaps
 
 
 def estimate_compound_offsets(runs):
@@ -480,6 +503,30 @@ def race_projection(quali, pace, grid_weight, known_grid=None):
     return df
 
 
+def team_colour_map(session_laps):
+    """Team -> '#rrggbb' using the colours F1 live timing publishes."""
+    frames = [v[["Team", "TeamColor"]] for v in session_laps.values()
+              if v is not None and not v.empty and "TeamColor" in v.columns]
+    if not frames:
+        return {}
+    df = pd.concat(frames).dropna()
+    out = {}
+    for team, col in df.groupby("Team")["TeamColor"].first().items():
+        col = str(col).strip().lstrip("#")
+        if re.fullmatch(r"[0-9a-fA-F]{6}", col):
+            out[team] = "#" + col
+    return out
+
+
+def teammate_dash(drivers_teams):
+    """Second driver in each team gets a dashed line, like the timing screens."""
+    dash, seen = {}, {}
+    for drv, team in sorted(drivers_teams):
+        seen[team] = seen.get(team, 0) + 1
+        dash[drv] = "solid" if seen[team] == 1 else "dash"
+    return dash
+
+
 # ---------- Pirelli strategy + announced penalties (from strategies.json) ----------
 def load_race_notes(year, round_number):
     """Reads this race's entry from strategies.json in the repo, if there is one."""
@@ -489,6 +536,84 @@ def load_race_notes(year, round_number):
     except Exception:
         return {}
     return data.get(f"{year}-{round_number}", {})
+
+
+PIRELLI_FEED = "https://press.pirelli.com/tagfeed/en/tags/{year}__season"
+_STRAT_WORDS = re.compile(r"\b(one|two|three|single|1|2|3)[- ]?stop|\bstop strategy|\bstops?\b", re.I)
+_COMPOUND_WORDS = re.compile(r"\b(soft|medium|hard)s?\b", re.I)
+_PICK_WORDS = re.compile(r"preferred|quickest|fastest|optimal|optimum|best|favou?r|recommended|most effective", re.I)
+
+
+def _plain(text):
+    text = unicodedata.normalize("NFKD", text or "")
+    return "".join(ch for ch in text if not unicodedata.combining(ch)).lower()
+
+
+def _html_to_text(raw):
+    txt = re.sub(r"<[^>]+>", " ", raw or "")
+    return re.sub(r"\s+", " ", htmllib.unescape(txt)).strip()
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_pirelli_items(year):
+    r = requests.get(PIRELLI_FEED.format(year=year), timeout=20,
+                     headers={"User-Agent": "Mozilla/5.0 (F1 Podium Predictor)"})
+    r.raise_for_status()
+    root = ET.fromstring(r.content)
+    items = []
+    for it in root.iter("item"):
+        get = lambda tag: (it.findtext(tag) or "")
+        body = get("description")
+        content = it.find("{http://purl.org/rss/1.0/modules/content/}encoded")
+        if content is not None and content.text:
+            body = content.text
+        try:
+            published = pd.Timestamp(pd.to_datetime(get("pubDate"), utc=True))
+        except Exception:
+            published = None
+        items.append({"title": get("title"), "link": get("link"), "published": published,
+                      "categories": get("category"), "text": _html_to_text(body)})
+    return items
+
+
+def pirelli_strategy(year, event):
+    """Finds Pirelli's latest pre-race release for this weekend and pulls out the
+    strategy sentences. Returns a dict like strategies.json entries, or None."""
+    try:
+        items = fetch_pirelli_items(year)
+    except Exception:
+        return None
+    race_date = session_date_for(event, "Race")
+    first = session_date_for(event, "Practice 1") or race_date
+    if race_date is None:
+        return None
+    to_utc = lambda t: t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
+    race_date, first = to_utc(race_date), to_utc(first)
+    name = _plain(str(event["EventName"]).replace("Grand Prix", ""))
+    loc = _plain(str(event["Location"]))
+
+    candidates = []
+    for it in items:
+        pub = it["published"]
+        if pub is None or not (first - pd.Timedelta(days=6) <= pub <= race_date):
+            continue  # only previews and Friday/Saturday notes, not the race report
+        tag_text = _plain(it["categories"] + " " + it["title"] + " " + it["text"][:600])
+        named = name.strip() in tag_text or loc in tag_text
+        sentences = re.split(r"(?<=[.!?])\s+", it["text"])
+        strat = [x for x in sentences if _STRAT_WORDS.search(x) and _COMPOUND_WORDS.search(x)
+                 and len(x) < 400]
+        if strat and named:
+            candidates.append((pub, it, strat))
+    if not candidates:
+        return None
+    pub, it, strat = max(candidates, key=lambda c: c[0])  # latest = most informed
+    headline = next((x for x in strat if _PICK_WORDS.search(x)), strat[0])
+    compounds = sorted({m.upper() for m in _COMPOUND_WORDS.findall(headline)},
+                       key=["SOFT", "MEDIUM", "HARD"].index)
+    details = [x for x in strat if x != headline][:3]
+    return {"strategy": headline, "details": details, "compounds": compounds,
+            "source": f"Pirelli press release, {pub.strftime('%a %d %b')} (auto-imported)",
+            "url": it["link"], "title": it["title"]}
 
 
 def apply_grid_drops(grid, drops):
@@ -609,13 +734,18 @@ if len(selected_compounds) < 3:
     st.caption("Using only " + ", ".join(c.title() for c in ("SOFT", "MEDIUM", "HARD")
                                          if c in selected_compounds) + " tyre laps.")
 
-runs = _stint_runs(session_laps, min_long_run)
+runs, runlaps = _stint_runs(session_laps, min_long_run)
+TEAM_COLOURS = team_colour_map(session_laps)
 compound_offsets, compound_source, session_shift = estimate_compound_offsets(runs)
 quali = quali_projection(session_laps, compound_offsets)
 pace = long_run_pace(runs, compound_offsets, session_shift)
 actual_quali = load_session_result(year, round_number, event, "Qualifying", 1.5)
 official_grid = load_starting_grid(year, round_number, event) if actual_quali is not None else None
 race_notes = load_race_notes(year, round_number)
+if not race_notes.get("strategy"):
+    auto = pirelli_strategy(year, event)
+    if auto:
+        race_notes = {**race_notes, **auto}
 announced_drops = race_notes.get("grid_drops", {}) or {}
 if official_grid is not None:
     known_grid = official_grid
@@ -673,6 +803,8 @@ with left:
         st.markdown("#### 🛞 Pirelli's likely race strategy")
         if race_notes.get("strategy"):
             st.markdown(f"**{race_notes['strategy']}**")
+            if race_notes.get("title"):
+                st.caption(race_notes["title"])
             for line in race_notes.get("details", []):
                 st.markdown(f"- {line}")
             plan = {c.upper() for c in race_notes.get("compounds", [])}
@@ -689,9 +821,9 @@ with left:
             else:
                 st.caption(f"Source: {src}")
         else:
-            st.write("No strategy entered for this race yet.")
-            st.caption("Pirelli usually publishes its strategy call after qualifying. "
-                       "Add it to strategies.json in the repo to show it here.")
+            st.write("Pirelli hasn't published a strategy call for this race yet.")
+            st.caption("It usually appears after qualifying. The app checks Pirelli's press feed "
+                       "automatically; tap Refresh data to check again.")
 with right:
     with st.container(border=True):
         st.markdown("#### ⚠️ Grid penalties")
@@ -711,7 +843,7 @@ with right:
         for note in race_notes.get("penalty_notes", []):
             st.caption(note)
 
-tab1, tab2, tab3 = st.tabs(["🏆 Podium", "⏱️ Qualifying", "🏎️ Race"])
+tab1, tab2, tab3, tab4 = st.tabs(["🏆 Podium", "⏱️ Qualifying", "🏎️ Race", "📈 Long runs"])
 
 with tab1:
     if race is None or race.empty:
@@ -767,6 +899,7 @@ with tab2:
         st.dataframe(show, hide_index=True, use_container_width=True)
         st.caption("Gaps are tyre-adjusted to medium-equivalent lap times (see Race tab for the values).")
         fig = px.bar(quali, x="Driver", y="QualiScore", color="Team",
+                     color_discrete_map=TEAM_COLOURS,
                      title="Projected qualifying gap to fastest (%)")
         st.plotly_chart(fig, use_container_width=True)
 
@@ -802,8 +935,84 @@ with tab3:
                 st.write("Track evolution correction (long runs, vs the first session used): " +
                          ", ".join(f"{k} {v:+.2f}s" for k, v in session_shift.items()))
         fig = px.scatter(race, x="RaceGapPct", y="DegPerLap", text="Driver",
-                         color="Team", title="Long-run pace vs tyre degradation")
+                         color="Team", color_discrete_map=TEAM_COLOURS,
+                         title="Long-run pace vs tyre degradation")
         fig.update_traces(textposition="top center")
         st.plotly_chart(fig, use_container_width=True)
+
+with tab4:
+    if runlaps is None or runlaps.empty:
+        st.write(f"No long runs of {min_long_run}+ laps found. Try lowering the minimum long-run length in Settings.")
+    else:
+        lr = runlaps.copy()
+        # medium-equivalent, track-evolution-corrected lap times (what the model uses)
+        lr["Adjusted"] = (lr["LapSeconds"] - lr["Compound"].map(compound_offsets).fillna(0.0)
+                          - lr["Session"].map(session_shift or {}).fillna(0.0))
+
+        order = list(race["Driver"]) if race is not None and not race.empty else sorted(lr["Driver"].unique())
+        order = [d for d in order if d in set(lr["Driver"])]
+        c1, c2, c3 = st.columns([3, 1.3, 1.5])
+        picked = c1.multiselect("Drivers", order, default=order[:6],
+                                help="Defaults to the top 6 in the race projection.")
+        sess_opts = ["All"] + sorted(lr["Session"].unique())
+        sess_pick = c2.selectbox("Session", sess_opts)
+        view = c3.radio("Lap times", ["Raw", "Adjusted"], horizontal=True,
+                        help="Adjusted = converted to medium tyres and corrected for track "
+                             "evolution, the way the model compares them.")
+        y_col = "LapSeconds" if view == "Raw" else "Adjusted"
+
+        sel = lr[lr["Driver"].isin(picked)]
+        if sess_pick != "All":
+            sel = sel[sel["Session"] == sess_pick]
+        if sel.empty:
+            st.write("Pick at least one driver with a long run in that session.")
+        else:
+            dash = teammate_dash(set(zip(lr["Driver"], lr["Team"])))
+            sel = sel.copy()
+            sel["Line"] = sel["Driver"].map(dash)
+            sel["Lap time"] = sel[y_col].map(lambda x: f"{int(x // 60)}:{x % 60:06.3f}")
+
+            fig = px.line(sel, x="RunLap", y=y_col, color="Team", line_group="Run",
+                          line_dash="Line", line_dash_map={"solid": "solid", "dash": "dash"},
+                          symbol="Compound",
+                          symbol_map={"SOFT": "circle", "MEDIUM": "diamond", "HARD": "square"},
+                          markers=True, color_discrete_map=TEAM_COLOURS,
+                          hover_name="Run",
+                          hover_data={"Lap time": True, "TyreLife": True, "RunLap": False,
+                                      y_col: False, "Line": False, "Team": True, "Compound": False},
+                          labels={"RunLap": "Lap of the run", y_col: "Lap time (s)",
+                                  "TyreLife": "Tyre age"},
+                          title=f"Long-run lap times ({view.lower()})")
+            seen_legend = set()
+            for t in fig.data:
+                t.name = t.name.split(",")[0]
+                t.legendgroup = t.name
+                t.showlegend = t.name not in seen_legend
+                seen_legend.add(t.name)
+            fig.update_layout(legend_title_text="Team", hovermode="closest")
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption("Solid line = first driver of each team, dashed = teammate. "
+                       "● Soft  ◆ Medium  ■ Hard. Lower is faster.")
+
+            med_order = sel.groupby("Driver")[y_col].median().sort_values().index.tolist()
+            fig2 = px.box(sel, x="Driver", y=y_col, color="Team", points="all",
+                          category_orders={"Driver": med_order},
+                          color_discrete_map=TEAM_COLOURS,
+                          labels={y_col: "Lap time (s)"},
+                          title="Spread of long-run lap times (fastest median on the left)")
+            fig2.update_layout(showlegend=False)
+            st.plotly_chart(fig2, use_container_width=True)
+
+            deg = (runs[runs["Driver"].isin(picked)] if sess_pick == "All"
+                   else runs[runs["Driver"].isin(picked) & (runs["Session"] == sess_pick)])
+            if not deg.empty:
+                deg = deg.groupby(["Driver", "Team"])["DegPerLap"].mean().reset_index()
+                deg = deg.sort_values("DegPerLap")
+                fig3 = px.bar(deg, x="Driver", y="DegPerLap", color="Team",
+                              color_discrete_map=TEAM_COLOURS,
+                              labels={"DegPerLap": "Seconds lost per lap"},
+                              title="Tyre degradation (lower is better)")
+                fig3.update_layout(showlegend=False)
+                st.plotly_chart(fig3, use_container_width=True)
 
 st.caption("Built from FastF1 and OpenF1 data. Projections are estimates, not guarantees.")
