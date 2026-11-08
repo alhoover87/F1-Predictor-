@@ -738,7 +738,7 @@ def apply_palette():
         background-color: #ffffff !important; color: {p['pine']} !important;
     }}
     [data-testid="stSidebar"], [data-testid="stSidebarContent"] {{
-        background-color: {p['mint']} !important;
+        background-color: {p['pine']} !important;
     }}
     [data-testid="stApp"] p, [data-testid="stApp"] li, [data-testid="stApp"] label,
     [data-testid="stApp"] span, [data-testid="stMarkdownContainer"],
@@ -765,6 +765,51 @@ def apply_palette():
     [data-testid="stAlert"] {{ background-color: rgba(207,255,220,0.6) !important; }}
     [data-testid="stAlert"] p {{ color: {p['pine']} !important; }}
     h1, h2, h3, h4 {{ color: {p['pine']} !important; }}
+    /* dark green Settings pane: light text, white inputs */
+    [data-testid="stApp"] [data-testid="stSidebar"] h1,
+    [data-testid="stApp"] [data-testid="stSidebar"] h2,
+    [data-testid="stApp"] [data-testid="stSidebar"] h3,
+    [data-testid="stApp"] [data-testid="stSidebar"] p,
+    [data-testid="stApp"] [data-testid="stSidebar"] li,
+    [data-testid="stApp"] [data-testid="stSidebar"] label,
+    [data-testid="stApp"] [data-testid="stSidebar"] span,
+    [data-testid="stApp"] [data-testid="stSidebar"] summary,
+    [data-testid="stApp"] [data-testid="stSidebar"] [data-testid="stMarkdownContainer"],
+    [data-testid="stApp"] [data-testid="stSidebar"] [data-testid="stCaptionContainer"],
+    [data-testid="stApp"] [data-testid="stSidebar"] [data-testid="stWidgetLabel"] {{
+        color: {p['mint']} !important;
+    }}
+    [data-testid="stApp"] [data-testid="stSidebar"] [data-baseweb="select"] *,
+    [data-testid="stApp"] [data-testid="stSidebar"] [data-baseweb="input"] * {{
+        color: {p['pine']} !important;
+    }}
+    /* status boxes inside the dark pane: dark tint, light text */
+    [data-testid="stApp"] [data-testid="stSidebar"] [data-testid="stAlert"],
+    [data-testid="stApp"] [data-testid="stSidebar"] [data-testid="stAlert"] > div {{
+        background-color: rgba(37, 61, 44, 0.65) !important;
+        border: 1px solid {p['leaf']} !important;
+    }}
+    [data-testid="stApp"] [data-testid="stSidebar"] [data-testid="stAlert"] *,
+    [data-testid="stApp"] [data-testid="stSidebar"] code {{
+        color: {p['mint']} !important; background-color: transparent !important;
+    }}
+    [data-testid="stApp"] [data-testid="stSidebar"] a {{ color: {p['mint']} !important; text-decoration: underline; }}
+    [data-testid="stApp"] [data-testid="stSidebar"] [data-testid="stTooltipIcon"] svg,
+    [data-testid="stApp"] [data-testid="stSidebar"] [data-testid="stExpander"] svg {{
+        color: {p['mint']} !important; fill: {p['mint']} !important;
+    }}
+    [data-testid="stApp"] [data-testid="stSidebar"] [data-testid="stCaptionContainer"] {{ opacity: 1; }}
+    [data-testid="stApp"] [data-testid="stSidebar"] [data-testid="stExpander"] details {{
+        background: {p['forest']} !important; border-color: {p['leaf']} !important;
+    }}
+    [data-testid="stSidebar"] .stButton > button {{ background: {p['leaf']}; color: {p['pine']}; }}
+    [data-testid="stSidebar"] .stButton > button p {{ color: {p['pine']} !important; }}
+    [data-testid="stSidebar"] .stButton > button:hover {{ background: {p['mint']}; }}
+    [data-testid="stSidebar"] [data-testid="stSliderTickBarMin"],
+    [data-testid="stSidebar"] [data-testid="stSliderTickBarMax"],
+    [data-testid="stSidebar"] [data-testid="stThumbValue"] {{ color: {p['mint']} !important; }}
+    [data-testid="stSidebar"] [role="radio"] > div:first-child {{ border-color: {p['mint']} !important; }}
+    [data-testid="stSidebarCollapseButton"] svg, [data-testid="stSidebarHeader"] svg {{ fill: {p['mint']}; color: {p['mint']}; }}
     h1 {{ border-bottom: 3px solid {p['leaf']}; padding-bottom: .3rem; }}
     [data-testid="stSidebar"] {{ border-right: 2px solid {p['leaf']}; }}
     [data-testid="stSidebar"] h1 {{ border-bottom: none; }}
@@ -773,7 +818,7 @@ def apply_palette():
         background: rgba(207, 255, 220, 0.35);
     }}
     [data-testid="stSidebar"] [data-testid="stVerticalBlockBorderWrapper"] {{
-        background: #ffffff;
+        background: {p['forest']} !important;
     }}
     [data-testid="stMetric"] {{
         background: {p['mint']}; border: 1px solid {p['leaf']};
@@ -785,8 +830,13 @@ def apply_palette():
         background: {p['mint']}; border-radius: 8px 8px 0 0; padding: .4rem .9rem;
     }}
     .stTabs [data-baseweb="tab"] p {{ color: {p['pine']}; }}
-    .stTabs [aria-selected="true"] {{ background: {p['forest']}; }}
-    .stTabs [aria-selected="true"] p {{ color: #ffffff !important; font-weight: 700; }}
+    .stTabs [aria-selected="true"] {{ background: {p['leaf']}; }}
+    .stTabs [aria-selected="true"] p {{ color: {p['pine']} !important; font-weight: 700; }}
+    /* tags in multiselects (forest green chips) */
+    [data-baseweb="tag"] * {{ color: #ffffff !important; fill: #ffffff !important; }}
+    /* main-page buttons are forest green: keep their text white */
+    [data-testid="stMain"] .stButton > button p {{ color: #ffffff !important; }}
+    .stTabs [data-baseweb="tab-highlight"] {{ background-color: {p['forest']} !important; }}
     .stButton > button {{
         background: {p['forest']}; color: #ffffff; border: none; font-weight: 700;
     }}
