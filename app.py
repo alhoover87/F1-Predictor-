@@ -731,6 +731,39 @@ PALETTE = {"forest": "#3E6F40", "mint": "#CFFFDC", "leaf": "#68BA7F", "pine": "#
 def apply_palette():
     p = PALETTE
     st.markdown(f"""<style>
+    /* Force the light look even if the browser or Streamlit picks dark mode */
+    :root {{ color-scheme: light; }}
+    [data-testid="stApp"], [data-testid="stAppViewContainer"], [data-testid="stMain"],
+    [data-testid="stHeader"], [data-testid="stBottomBlockContainer"] {{
+        background-color: #ffffff !important; color: {p['pine']} !important;
+    }}
+    [data-testid="stSidebar"], [data-testid="stSidebarContent"] {{
+        background-color: {p['mint']} !important;
+    }}
+    [data-testid="stApp"] p, [data-testid="stApp"] li, [data-testid="stApp"] label,
+    [data-testid="stApp"] span, [data-testid="stMarkdownContainer"],
+    [data-testid="stCaptionContainer"], [data-testid="stWidgetLabel"] {{
+        color: {p['pine']} !important;
+    }}
+    [data-testid="stCaptionContainer"] {{ opacity: .8; }}
+    /* inputs, dropdowns, multiselects */
+    [data-baseweb="select"] > div, [data-baseweb="input"] > div, [data-baseweb="input"] input,
+    [data-testid="stNumberInput"] input, [data-baseweb="popover"] ul, [data-baseweb="menu"] {{
+        background-color: #ffffff !important; color: {p['pine']} !important;
+        border-color: {p['leaf']} !important;
+    }}
+    [data-baseweb="popover"] li {{ color: {p['pine']} !important; }}
+    [data-baseweb="popover"] li:hover {{ background-color: {p['mint']} !important; }}
+    [data-baseweb="tag"] {{ background-color: {p['forest']} !important; }}
+    [data-baseweb="tag"] span {{ color: #ffffff !important; }}
+    /* tables */
+    [data-testid="stDataFrame"], [data-testid="stTable"] {{
+        background-color: #ffffff !important; border: 1px solid {p['leaf']}; border-radius: 6px;
+    }}
+    /* code blocks and alerts */
+    [data-testid="stCode"], pre, code {{ background-color: {p['mint']} !important; color: {p['pine']} !important; }}
+    [data-testid="stAlert"] {{ background-color: rgba(207,255,220,0.6) !important; }}
+    [data-testid="stAlert"] p {{ color: {p['pine']} !important; }}
     h1, h2, h3, h4 {{ color: {p['pine']} !important; }}
     h1 {{ border-bottom: 3px solid {p['leaf']}; padding-bottom: .3rem; }}
     [data-testid="stSidebar"] {{ border-right: 2px solid {p['leaf']}; }}
@@ -858,6 +891,15 @@ available = [k for k, v in session_laps.items() if v is not None and not v.empty
 
 with st.sidebar.expander("Diagnostics", expanded=not available):
     st.write(f"FastF1 version: {fastf1.__version__}")
+    try:
+        cfg_base = st.get_option("theme.base")
+        cfg_bg = st.get_option("theme.backgroundColor")
+    except Exception:
+        cfg_base, cfg_bg = None, None
+    if cfg_bg:
+        st.success(f"Theme config found: base={cfg_base}, background={cfg_bg}")
+    else:
+        st.warning("Theme config file NOT found. Check .streamlit/config.toml sits next to app.py.")
     st.write(f"Event picked: {event['EventName']} (round {round_number})")
     for short in sess_map:
         if short in load_errors:
