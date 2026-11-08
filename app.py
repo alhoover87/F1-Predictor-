@@ -546,14 +546,15 @@ def track_outline_svg(year, session_name, session_date_utc):
         x, y = y, -x
     w, h = x.max() - x.min(), y.max() - y.min()
     scale = 1000 / max(w, h)
-    px_ = (x - x.min()) * scale + 40
-    py_ = (y.max() - y) * scale + 40  # SVG y runs downward
-    vw, vh = w * scale + 80, h * scale + 80
+    pad = 90  # breathing room so the outline never touches the panel edges
+    px_ = (x - x.min()) * scale + pad
+    py_ = (y.max() - y) * scale + pad  # SVG y runs downward
+    vw, vh = w * scale + 2 * pad, h * scale + 2 * pad
     path = " ".join(f"{a:.1f},{b:.1f}" for a, b in zip(px_, py_))
     return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {vw:.0f} {vh:.0f}">'
-            f'<polyline points="{path}" fill="none" stroke="#ffffff" stroke-opacity="0.08" '
+            f'<polyline points="{path}" fill="none" stroke="#CFFFDC" stroke-opacity="0.07" '
             f'stroke-width="26" stroke-linejoin="round" stroke-linecap="round"/>'
-            f'<polyline points="{path}" fill="none" stroke="#ffffff" stroke-opacity="0.10" '
+            f'<polyline points="{path}" fill="none" stroke="#CFFFDC" stroke-opacity="0.12" '
             f'stroke-width="7" stroke-linejoin="round" stroke-linecap="round"/></svg>')
 
 
@@ -576,12 +577,14 @@ def set_track_background(event, year):
         return
     b64 = base64.b64encode(svg.encode()).decode()
     st.markdown(f"""<style>
-    [data-testid="stApp"] {{
+    /* main panel only, so the track is centred in the space beside Settings.
+       The main panel is the scrolling element, so the track stays put while you scroll */
+    [data-testid="stMain"], section.main {{
         background-image: url("data:image/svg+xml;base64,{b64}");
         background-repeat: no-repeat;
-        background-position: center 60%;
-        background-size: min(85vw, 1100px) auto;
-        background-attachment: fixed;
+        background-position: center center;
+        background-size: contain;
+        background-attachment: scroll;
     }}
     </style>""", unsafe_allow_html=True)
 
@@ -721,7 +724,54 @@ def apply_grid_drops(grid, drops):
     return g
 
 
+# ---------- Colour palette ----------
+PALETTE = {"forest": "#3E6F40", "mint": "#CFFFDC", "leaf": "#68BA7F", "pine": "#253D2C"}
+
+
+def apply_palette():
+    p = PALETTE
+    st.markdown(f"""<style>
+    h1, h2, h3, h4 {{ color: {p['mint']} !important; }}
+    h1 {{ border-bottom: 3px solid {p['leaf']}; padding-bottom: .3rem; }}
+    [data-testid="stSidebar"] {{ border-right: 2px solid {p['leaf']}; }}
+    [data-testid="stSidebar"] h1 {{ border-bottom: none; }}
+    [data-testid="stVerticalBlockBorderWrapper"] {{
+        border-color: {p['leaf']} !important;
+        background: rgba(62, 111, 64, 0.35);
+    }}
+    [data-testid="stSidebar"] [data-testid="stVerticalBlockBorderWrapper"] {{
+        background: rgba(37, 61, 44, 0.55);
+    }}
+    [data-testid="stMetric"] {{
+        background: {p['forest']}; border: 1px solid {p['leaf']};
+        border-radius: 10px; padding: .6rem .8rem;
+    }}
+    [data-testid="stMetricValue"] {{ color: {p['mint']}; }}
+    .stTabs [data-baseweb="tab-list"] {{ gap: .4rem; }}
+    .stTabs [data-baseweb="tab"] {{
+        background: {p['forest']}; border-radius: 8px 8px 0 0; padding: .4rem .9rem;
+    }}
+    .stTabs [aria-selected="true"] {{ background: {p['leaf']}; color: {p['pine']} !important; }}
+    .stTabs [aria-selected="true"] p {{ color: {p['pine']} !important; font-weight: 700; }}
+    .stButton > button {{
+        background: {p['leaf']}; color: {p['pine']}; border: none; font-weight: 700;
+    }}
+    .stButton > button:hover {{ background: {p['mint']}; color: {p['pine']}; }}
+    [data-testid="stExpander"] details {{ border-color: {p['leaf']} !important; }}
+    </style>""", unsafe_allow_html=True)
+
+
+def style_fig(fig):
+    """Transparent chart backgrounds with palette-coloured text and grid lines."""
+    fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(37,61,44,0.45)",
+                      font_color=PALETTE["mint"], title_font_color=PALETTE["mint"])
+    fig.update_xaxes(gridcolor="rgba(207,255,220,0.12)", zerolinecolor="rgba(207,255,220,0.25)")
+    fig.update_yaxes(gridcolor="rgba(207,255,220,0.12)", zerolinecolor="rgba(207,255,220,0.25)")
+    return fig
+
+
 # ---------- UI ----------
+apply_palette()
 st.title("F1 Podium Predictor")
 
 st.sidebar.title("⚙️ Settings")
@@ -732,8 +782,29 @@ labels = [f"R{int(r.RoundNumber)} – {r.EventName}" for r in events.itertuples(
 pick = st.sidebar.selectbox("Track", range(len(labels)), index=default_idx,
                             format_func=lambda i: labels[i])
 event = events.iloc[pick]
-data_box = st.sidebar.container(border=True)  # small "Data used" summary, filled in below
+race_notes = load_race_notes(year, int(event["RoundNumber"]))
+if not race_notes.get("strategy"):
+    auto = pirelli_strategy(year, event)
+    if auto:
+        race_notes = {**race_notes, **auto}
+
+data_box = st.sidebar.container(border=True)  # "Data used" box: tyre dropdown + summary
 data_lines = []
+pirelli_plan = {c.upper() for c in race_notes.get("compounds", [])} & {"SOFT", "MEDIUM", "HARD"}
+TYRE_CHOICES = {"All compounds": {"SOFT", "MEDIUM", "HARD"}}
+if pirelli_plan:
+    label = " + ".join(c.title() for c in ("SOFT", "MEDIUM", "HARD") if c in pirelli_plan)
+    TYRE_CHOICES[f"Match Pirelli strategy ({label})"] = pirelli_plan
+TYRE_CHOICES.update({
+    "Soft only": {"SOFT"}, "Medium only": {"MEDIUM"}, "Hard only": {"HARD"},
+    "Soft + Medium": {"SOFT", "MEDIUM"}, "Medium + Hard": {"MEDIUM", "HARD"},
+    "Soft + Hard": {"SOFT", "HARD"},
+})
+with data_box:
+    st.markdown("**Data used**")
+    tyre_pick = st.selectbox("Tyre type", list(TYRE_CHOICES.keys()), index=0,
+                             help="Which tyre compounds' laps feed the projections.")
+selected_compounds = set(TYRE_CHOICES[tyre_pick])
 FP_CHOICES = {
     "All sessions (FP1 + FP2 + FP3)": ["FP1", "FP2", "FP3"],
     "FP1 only": ["FP1"],
@@ -746,12 +817,6 @@ fp_pick = st.sidebar.radio("Practice data to use", list(FP_CHOICES.keys()), inde
                            help="Only the selected sessions feed the qualifying and race projections.")
 selected_fp = FP_CHOICES[fp_pick]
 
-st.sidebar.markdown("**Tyre compounds to use**")
-tc1, tc2, tc3 = st.sidebar.columns(3)
-use_soft = tc1.checkbox("Soft", value=True)
-use_med = tc2.checkbox("Medium", value=True)
-use_hard = tc3.checkbox("Hard", value=True)
-selected_compounds = {c for c, on in (("SOFT", use_soft), ("MEDIUM", use_med), ("HARD", use_hard)) if on}
 
 min_long_run = st.sidebar.slider(
     "Minimum long-run length (laps)", 3, 15, 5,
@@ -806,7 +871,7 @@ if not available:
 data_lines.append("Sessions: " + ", ".join(available))
 
 if not selected_compounds:
-    st.warning("Pick at least one tyre compound in Settings.")
+    st.warning("Pick a tyre type in Settings.")
     st.stop()
 # keep only laps on the chosen compounds
 session_laps = {
@@ -814,11 +879,10 @@ session_laps = {
     for k, v in session_laps.items()
 }
 if all(v is None or v.empty for v in session_laps.values()):
-    st.warning("No laps on the selected tyre compounds in these sessions. Try adding another compound.")
+    st.warning("No laps on the selected tyre type in these sessions. Try another option under Tyre type.")
     st.stop()
-if len(selected_compounds) < 3:
-    data_lines.append("Tyres: " + ", ".join(c.title() for c in ("SOFT", "MEDIUM", "HARD")
-                                              if c in selected_compounds) + " only")
+data_lines.append("Tyres: " + ", ".join(c.title() for c in ("SOFT", "MEDIUM", "HARD")
+                                          if c in selected_compounds))
 
 runs, runlaps = _stint_runs(session_laps, min_long_run)
 TEAM_COLOURS = team_colour_map(session_laps)
@@ -827,11 +891,6 @@ quali = quali_projection(session_laps, compound_offsets)
 pace = long_run_pace(runs, compound_offsets, session_shift)
 actual_quali = load_session_result(year, round_number, event, "Qualifying", 1.5)
 official_grid = load_starting_grid(year, round_number, event) if actual_quali is not None else None
-race_notes = load_race_notes(year, round_number)
-if not race_notes.get("strategy"):
-    auto = pirelli_strategy(year, event)
-    if auto:
-        race_notes = {**race_notes, **auto}
 announced_drops = race_notes.get("grid_drops", {}) or {}
 if official_grid is not None:
     known_grid = official_grid
@@ -883,7 +942,6 @@ else:
 data_lines.append(f"Long runs: {min_long_run}+ laps · Grid weight: {grid_weight:.0%}")
 
 with data_box:
-    st.markdown("**Data used**")
     for line in data_lines:
         st.caption(line)
 
@@ -902,9 +960,7 @@ with left:
                 if plan == selected_compounds:
                     st.caption("✓ Your tyre settings match this strategy.")
                 else:
-                    st.caption("Tip: to match this strategy, tick only " +
-                               " + ".join(c.title() for c in ("SOFT", "MEDIUM", "HARD") if c in plan) +
-                               " in Settings.")
+                    st.caption("Tip: choose \"Match Pirelli strategy\" under Tyre type in Settings.")
             src = race_notes.get("source", "Pirelli")
             if race_notes.get("url"):
                 st.caption(f"Source: [{src}]({race_notes['url']})")
@@ -991,7 +1047,7 @@ with tab2:
         fig = px.bar(quali, x="Driver", y="QualiScore", color="Team",
                      color_discrete_map=TEAM_COLOURS,
                      title="Projected qualifying gap to fastest (%)")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(style_fig(fig), use_container_width=True, theme=None)
 
 with tab3:
     if race is None or race.empty:
@@ -1028,7 +1084,7 @@ with tab3:
                          color="Team", color_discrete_map=TEAM_COLOURS,
                          title="Long-run pace vs tyre degradation")
         fig.update_traces(textposition="top center")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(style_fig(fig), use_container_width=True, theme=None)
 
 with tab4:
     if runlaps is None or runlaps.empty:
@@ -1080,7 +1136,7 @@ with tab4:
                 t.showlegend = t.name not in seen_legend
                 seen_legend.add(t.name)
             fig.update_layout(legend_title_text="Team", hovermode="closest")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(style_fig(fig), use_container_width=True, theme=None)
             st.caption("Solid line = first driver of each team, dashed = teammate. "
                        "● Soft  ◆ Medium  ■ Hard. Lower is faster.")
 
@@ -1091,7 +1147,7 @@ with tab4:
                           labels={y_col: "Lap time (s)"},
                           title="Spread of long-run lap times (fastest median on the left)")
             fig2.update_layout(showlegend=False)
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(style_fig(fig2), use_container_width=True, theme=None)
 
             deg = (runs[runs["Driver"].isin(picked)] if sess_pick == "All"
                    else runs[runs["Driver"].isin(picked) & (runs["Session"] == sess_pick)])
@@ -1103,6 +1159,6 @@ with tab4:
                               labels={"DegPerLap": "Seconds lost per lap"},
                               title="Tyre degradation (lower is better)")
                 fig3.update_layout(showlegend=False)
-                st.plotly_chart(fig3, use_container_width=True)
+                st.plotly_chart(style_fig(fig3), use_container_width=True, theme=None)
 
 st.caption("Built from FastF1 and OpenF1 data. Projections are estimates, not guarantees.")
