@@ -479,30 +479,7 @@ def race_projection(quali, pace, grid_weight, known_grid=None):
 
 
 # ---------- UI ----------
-LOGO_SVG = """
-<svg width="96" height="48" viewBox="0 0 96 48" xmlns="http://www.w3.org/2000/svg" aria-label="Podium Predictor logo">
-  <g fill="#e10600">
-    <rect x="2"  y="14" width="18" height="4" rx="2" opacity="0.55"/>
-    <rect x="8"  y="22" width="16" height="4" rx="2" opacity="0.75"/>
-    <rect x="4"  y="30" width="20" height="4" rx="2" opacity="0.55"/>
-    <rect x="30" y="22" width="20" height="24" rx="2"/>
-    <rect x="52" y="8"  width="20" height="38" rx="2"/>
-    <rect x="74" y="30" width="20" height="16" rx="2"/>
-  </g>
-  <g fill="#ffffff" font-family="Arial, Helvetica, sans-serif" font-weight="700" font-size="13" text-anchor="middle">
-    <text x="40" y="38">2</text>
-    <text x="62" y="26">1</text>
-    <text x="84" y="43">3</text>
-  </g>
-</svg>
-"""
-st.markdown(
-    f"""<div style="display:flex;align-items:center;gap:14px;margin:0 0 0.5rem 0;">
-        {LOGO_SVG}
-        <span style="font-size:2.4rem;font-weight:800;line-height:1.1;">F1 Podium Predictor</span>
-    </div>""",
-    unsafe_allow_html=True,
-)
+st.title("F1 Podium Predictor")
 
 st.sidebar.title("⚙️ Settings")
 this_year = datetime.now().year
