@@ -1999,4 +1999,122 @@ with tab5:
         running = bool(job and job.get("year") == year)
         c_run, c_stop, c_clear = st.columns([1, 1, 1])
         run_clicked = c_run.button("Run backtest", disabled=running)
-        if running and c_stop.but
+        if running and c_stop.button("Stop"):
+            del st.session_state["bt_job"]
+            st.rerun()
+        if c_clear.button("Clear saved results", disabled=running):
+            try:
+                backtest_path(year).unlink()
+            except Exception:
+                pass
+            if "bt_job" in st.session_state:
+                del st.session_state["bt_job"]
+            st.rerun()
+
+        if run_clicked:
+            # A run is a queue of (model, round) jobs. Each page refresh scores ONE job, saves it,
+            # then refreshes again, so no single step runs long enough to time out, and a run
+            # that gets cut off resumes from the saved file on the next press.
+            rows = []
+            if saved and saved.get("signature") == sig and not saved.get("complete"):
+                rows = saved.get("rows", [])  # unfinished run with the same settings: resume it
+            done_keys = {(r["Model"], r["Round"]) for r in rows}
+            base_settings = {**BASELINE_SETTINGS, "fp": settings["fp"], "compounds": settings["compounds"]}
+            models = [("This model", test_settings)] + ([("Previous model", base_settings)] if compare else [])
+            pending = [(label_, int(ev["RoundNumber"])) for ev in done_rounds[:n_test] for label_, _ in models
+                       if (label_, int(ev["RoundNumber"])) not in done_keys]
+            st.session_state["bt_job"] = {"year": year, "sig": sig, "pending": pending,
+                                          "total": len(models) * n_test, "n_test": n_test,
+                                          "models": dict(models)}
+            save_backtest(year, {"signature": sig, "rows": rows, "complete": False, "races": n_test,
+                                 "updated": datetime.now().strftime("%d %b %Y %H:%M")})
+            st.rerun()
+
+        if running:
+            saved = load_backtest(year) or {"signature": job["sig"], "rows": []}
+            rows = saved.get("rows", [])
+            total = max(job["total"], 1)
+            done_n = total - len(job["pending"])
+            st.progress(min(done_n / total, 1.0), text=f"Backtest running: {done_n} of {total} scored")
+            if job["pending"]:
+                label_, rnd = job["pending"][0]
+                ev_by_round = {int(e["RoundNumber"]): e for e in done_rounds}
+                ev = ev_by_round.get(rnd)
+                with st.spinner(f"Scoring {ev['EventName'] if ev is not None else f'round {rnd}'}: {label_}..."):
+                    row = {"Model": label_, "Round": rnd, "Race": ev["EventName"] if ev is not None else f"Round {rnd}"}
+                    try:
+                        if ev is None:
+                            raise ValueError("round not found in schedule")
+                        mm = run_model(year, rnd, ev, job["models"][label_])
+                        qs = score_prediction(mm["quali"], "ProjectedGrid", mm["actual_quali"], "Position")
+                        rs = score_prediction(mm["race"], "ProjectedFinish", mm["actual"], "ActualFinish")
+                        if qs:
+                            row.update({"Pole": qs["Top1"], "Q top3 hits": qs["Top3Hits"],
+                                        "Q avg error": qs["MAE"], "Q correlation": qs["Spearman"]})
+                        if rs:
+                            row.update({"Winner": rs["Top1"], "Podium hits": rs["Top3Hits"],
+                                        "Podium exact": rs["Top3Exact"], "R avg error": rs["MAE"],
+                                        "R correlation": rs["Spearman"]})
+                        if not qs and not rs:
+                            row["Note"] = "no data"
+                    except Exception as e:
+                        row["Note"] = f"{type(e).__name__}: {e}"
+                    rows = [r for r in rows if not (r["Model"] == label_ and r["Round"] == rnd)] + [row]
+                    job["pending"] = job["pending"][1:]
+                    st.session_state["bt_job"] = job
+                    save_backtest(year, {"signature": job["sig"], "rows": rows, "complete": not job["pending"],
+                                         "races": job["n_test"],
+                                         "updated": datetime.now().strftime("%d %b %Y %H:%M")})
+                st.rerun()
+            else:
+                save_backtest(year, {**saved, "complete": True})
+                del st.session_state["bt_job"]
+                st.rerun()
+
+        if saved and saved.get("rows"):
+            bt = pd.DataFrame(saved["rows"]).sort_values(["Round", "Model"], ascending=[False, True])
+            for col in ("Pole", "Winner"):  # JSON round-trip safety
+                if col in bt.columns:
+                    bt[col] = bt[col].map({True: True, False: False, "True": True, "False": False})
+            for col in ("Q top3 hits", "Q avg error", "Q correlation", "Podium hits", "Podium exact",
+                        "R avg error", "R correlation"):
+                if col in bt.columns:
+                    bt[col] = pd.to_numeric(bt[col], errors="coerce")
+            st.caption(f"Saved results from {saved.get('updated', '?')} · settings: {saved.get('signature', '?')}")
+            if saved.get("signature") != sig:
+                st.info("Your Settings have changed since this backtest was run. Press Run backtest to re-score "
+                        "with the current settings.")
+            summary_rows = []
+            for label_, g in bt.groupby("Model", sort=False):
+                def pct(col):
+                    return f"{g[col].mean() * 100:.0f}%" if col in g.columns and g[col].notna().any() else "–"
+
+                def avg(col, nd=2):
+                    return round(g[col].mean(), nd) if col in g.columns and g[col].notna().any() else "–"
+                summary_rows.append({
+                    "Model": label_,
+                    "Races": int(g["Pole"].notna().sum()) if "Pole" in g.columns else 0,
+                    "Pole right": pct("Pole"), "Quali top-3 hits (of 3)": avg("Q top3 hits"),
+                    "Quali avg error (places)": avg("Q avg error", 1),
+                    "Winner right": pct("Winner"), "Podium hits (of 3)": avg("Podium hits"),
+                    "Podium exact (of 3)": avg("Podium exact"),
+                    "Race avg error (places)": avg("R avg error", 1),
+                    "Race correlation": avg("R correlation"),
+                })
+            st.markdown("**Summary**")
+            show_table(pd.DataFrame(summary_rows))
+            st.caption("Correlation runs from -1 to 1; 1 means the predicted order matched the result exactly. "
+                       "Avg error is how many places each driver was off, on average.")
+            st.markdown("**Race by race**")
+            detail = bt.copy()
+            for col in ("Pole", "Winner"):
+                if col in detail.columns:
+                    detail[col] = detail[col].map({True: "✓", False: "✗"})
+            for col in ("Q avg error", "R avg error", "Q correlation", "R correlation"):
+                if col in detail.columns:
+                    detail[col] = pd.to_numeric(detail[col], errors="coerce").round(2)
+            show_table(detail.drop(columns=["Round"]).fillna("–"))
+            st.caption("If the previous model scores better on several races, lower the recent form weight "
+                       "or turn off the team correction in Settings and run again.")
+
+st.caption("Built from FastF1 and OpenF1 data. Projections are estimates, not guarantees.")
