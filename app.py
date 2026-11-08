@@ -876,6 +876,17 @@ def show_table(df):
     st.table(sty)
 
 
+def result_banner(text, icon="🎯"):
+    """Forest-green score box with light text, for how the prediction did."""
+    p = PALETTE
+    st.markdown(f"""
+    <div style="background:{p['forest']};border:1px solid {p['leaf']};border-radius:12px;
+                padding:.7rem 1rem;margin:.4rem 0 .8rem 0;color:#ffffff;font-size:1.05rem;
+                font-weight:700;">
+      <span style="margin-right:.5rem;">{icon}</span>{text}
+    </div>""", unsafe_allow_html=True)
+
+
 def podium_card(slot, medal, driver, team, note=None, good=None):
     """Forest-green podium card with light text and the team's colour as an accent."""
     p = PALETTE
@@ -1150,7 +1161,8 @@ with tab1:
                             "✓ predicted" if ok else "✗ missed", ok)
             hits = len(pred3 & set(real["Driver"]))
             exact = sum(a == b for a, b in zip(top3["Driver"], real["Driver"]))
-            st.success(f"{hits} of 3 podium drivers predicted, {exact} in the exact position.")
+            result_banner(f"{hits} of 3 podium drivers predicted, "
+                          f"<span style='color:{PALETTE['mint']};'>{exact} in the exact position</span>.")
 
 with tab2:
     if actual_quali is not None:
@@ -1165,8 +1177,8 @@ with tab2:
             pred_top3 = set(quali.head(3)["Driver"])
             hits = len(pred_top3 & set(aq.head(3)["Driver"]))
             pole_ok = (not quali.empty) and quali.iloc[0]["Driver"] == aq.iloc[0]["Driver"]
-            st.caption(f"Pole {'predicted ✓' if pole_ok else 'missed'} · "
-                       f"{hits} of 3 front-runners predicted")
+            result_banner(f"Pole {'predicted ✓' if pole_ok else 'missed'} · "
+                          f"<span style='color:{PALETTE['mint']};'>{hits} of 3 front-runners predicted</span>")
         show_table(aq.rename(columns={"Position": "Actual"}))
         if quali is not None:
             with st.expander("Show the practice-based projection"):
