@@ -756,10 +756,24 @@ def apply_palette():
     [data-baseweb="popover"] li:hover {{ background-color: {p['mint']} !important; }}
     [data-baseweb="tag"] {{ background-color: {p['forest']} !important; }}
     [data-baseweb="tag"] span {{ color: #ffffff !important; }}
-    /* tables */
-    [data-testid="stDataFrame"], [data-testid="stTable"] {{
-        background-color: #ffffff !important; border: 1px solid {p['leaf']}; border-radius: 6px;
+    /* tables: light mint rows, light-green header, dark text */
+    [data-testid="stTable"] {{ overflow-x: auto; }}
+    [data-testid="stTable"] table {{
+        width: 100%; border-collapse: collapse; background: #ffffff !important;
+        border: 1px solid {p['leaf']} !important; border-radius: 8px; overflow: hidden;
+        font-size: .92rem;
     }}
+    [data-testid="stTable"] th {{
+        background: {p['mint']} !important; color: {p['pine']} !important;
+        font-weight: 700 !important; text-align: left !important;
+        border-bottom: 2px solid {p['leaf']} !important; padding: .45rem .6rem !important;
+    }}
+    [data-testid="stTable"] td {{
+        background: #ffffff !important; color: {p['pine']} !important;
+        border-bottom: 1px solid rgba(104,186,127,0.35) !important; padding: .4rem .6rem !important;
+    }}
+    [data-testid="stTable"] tr:nth-child(even) td {{ background: #F3FFF6 !important; }}
+    [data-testid="stTable"] tr:hover td {{ background: {p['mint']} !important; }}
     /* code blocks and alerts */
     [data-testid="stCode"], pre, code {{ background-color: {p['mint']} !important; color: {p['pine']} !important; }}
     [data-testid="stAlert"] {{ background-color: rgba(207,255,220,0.6) !important; }}
@@ -854,6 +868,31 @@ def style_fig(fig):
     fig.update_yaxes(gridcolor="rgba(62,111,64,0.15)", zerolinecolor="rgba(62,111,64,0.35)",
                      linecolor="rgba(62,111,64,0.4)")
     return fig
+
+
+def show_table(df):
+    """Light-styled HTML table (Streamlit's interactive grid can't be recoloured)."""
+    sty = df.style.hide(axis="index").format(precision=3, na_rep="–")
+    st.table(sty)
+
+
+def podium_card(slot, medal, driver, team, note=None, good=None):
+    """Forest-green podium card with light text and the team's colour as an accent."""
+    p = PALETTE
+    accent = TEAM_COLOURS.get(team, p["leaf"])
+    badge = ""
+    if note:
+        bc = p["mint"] if good else "#FFD6D6"
+        badge = (f'<div style="margin-top:.35rem;font-size:.85rem;font-weight:700;color:{bc};">'
+                 f'{note}</div>')
+    team_line = f'<div style="font-size:.95rem;color:{p["mint"]};opacity:.95;">{team}</div>' if team else ""
+    slot.markdown(f"""
+    <div style="background:{p['forest']};border:1px solid {p['leaf']};border-left:8px solid {accent};
+                border-radius:12px;padding:.8rem 1rem;margin-bottom:.5rem;">
+      <div style="font-size:.95rem;color:{p['mint']};font-weight:600;">{medal}</div>
+      <div style="font-size:2rem;font-weight:800;color:#ffffff;line-height:1.15;">{driver}</div>
+      {team_line}{badge}
+    </div>""", unsafe_allow_html=True)
 
 
 # ---------- UI ----------
@@ -1074,7 +1113,7 @@ with right:
         if grid_changes is not None:
             gshow = grid_changes.copy()
             gshow["Change"] = gshow["Change"].map(lambda x: f"{x} place{'s' if x != 1 else ''} back")
-            st.dataframe(gshow, hide_index=True, use_container_width=True)
+            show_table(gshow)
             st.caption("From the official FIA grid." if official_grid is not None
                        else "From announced penalties (strategies.json). The official grid will replace this.")
         elif official_grid is not None:
@@ -1097,16 +1136,18 @@ with tab1:
         cols = st.columns(3)
         medals = ["🥇 P1", "🥈 P2", "🥉 P3"]
         for c, m, (_, r) in zip(cols, medals, top3.iterrows()):
-            c.metric(m, r["Driver"], r["Team"], delta_color="off")
+            podium_card(c, m, r["Driver"], r["Team"])
         st.caption(f"Predicted podium. Grid position weight: {grid_weight:.0%}")
         if actual is not None:
             st.markdown("**Actual podium**")
             real = actual.sort_values("ActualFinish").head(3)
             acols = st.columns(3)
             pred3 = set(top3["Driver"])
+            team_of = dict(zip(race["Driver"], race["Team"]))
             for c, m, (_, r) in zip(acols, medals, real.iterrows()):
-                c.metric(m, r["Driver"], "✓ predicted" if r["Driver"] in pred3 else "missed",
-                         delta_color="normal" if r["Driver"] in pred3 else "inverse")
+                ok = r["Driver"] in pred3
+                podium_card(c, m, r["Driver"], team_of.get(r["Driver"], ""),
+                            "✓ predicted" if ok else "✗ missed", ok)
             hits = len(pred3 & set(real["Driver"]))
             exact = sum(a == b for a, b in zip(top3["Driver"], real["Driver"]))
             st.success(f"{hits} of 3 podium drivers predicted, {exact} in the exact position.")
@@ -1126,21 +1167,19 @@ with tab2:
             pole_ok = (not quali.empty) and quali.iloc[0]["Driver"] == aq.iloc[0]["Driver"]
             st.caption(f"Pole {'predicted ✓' if pole_ok else 'missed'} · "
                        f"{hits} of 3 front-runners predicted")
-        st.dataframe(aq.rename(columns={"Position": "Actual"}), hide_index=True,
-                     use_container_width=True)
+        show_table(aq.rename(columns={"Position": "Actual"}))
         if quali is not None:
             with st.expander("Show the practice-based projection"):
                 show = quali[["ProjectedGrid", "Driver", "Team", "QualiScore"]].copy()
                 show["QualiScore"] = show["QualiScore"].round(3)
-                st.dataframe(show.rename(columns={"QualiScore": "Avg gap to best (%)"}),
-                             hide_index=True, use_container_width=True)
+                show_table(show.rename(columns={"QualiScore": "Avg gap to best (%)"}))
     elif quali is None:
         st.write("No qualifying projection available.")
     else:
         show = quali[["ProjectedGrid", "Driver", "Team", "QualiScore"]].copy()
         show["QualiScore"] = show["QualiScore"].round(3)
         show = show.rename(columns={"QualiScore": "Avg gap to best (%)"})
-        st.dataframe(show, hide_index=True, use_container_width=True)
+        show_table(show)
         st.caption("Gaps are tyre-adjusted to medium-equivalent lap times (see Race tab for the values).")
         fig = px.bar(quali, x="Driver", y="QualiScore", color="Team",
                      color_discrete_map=TEAM_COLOURS,
@@ -1166,13 +1205,12 @@ with tab3:
         show = show.rename(columns={"RaceGapPct": "Long-run gap (%)",
                                     "DegPerLap": "Tyre deg (s/lap)",
                                     "LongRunLaps": "Long-run laps"})
-        st.dataframe(show, hide_index=True, use_container_width=True)
+        show_table(show)
         with st.expander("Tyre compound adjustment"):
             st.write("All lap times are converted to medium-tyre equivalents before comparing.")
-            st.dataframe(pd.DataFrame([
+            show_table(pd.DataFrame([
                 {"Compound": c.title(), "Seconds vs medium": f"{compound_offsets[c]:+.2f}",
-                 "Source": compound_source[c]} for c in ("SOFT", "MEDIUM", "HARD")]),
-                hide_index=True, use_container_width=True)
+                 "Source": compound_source[c]} for c in ("SOFT", "MEDIUM", "HARD")]))
             st.caption("Measured = learned from drivers who ran more than one compound this weekend. "
                        "Typical = not enough data, so a standard value is used.")
             if session_shift:
