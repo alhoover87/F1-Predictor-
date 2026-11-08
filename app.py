@@ -18,15 +18,76 @@ from datetime import datetime
 st.set_page_config(page_title="F1 Podium Predictor", page_icon="🏆", layout="wide")
 fastf1.Cache.enable_cache("/tmp")
 
-QUALI_WEIGHTS = {"FP1": 0.20, "FP2": 0.35, "FP3": 0.45}
+# ---------- Model settings ----------
+# Single-lap (qualifying) pace: FP3 is the closest thing to a quali sim, late FP2 next.
+QUALI_WEIGHTS = {"FP1": 0.10, "FP2": 0.35, "FP3": 0.55}
+QUALI_WEIGHTS_LEGACY = {"FP1": 0.20, "FP2": 0.35, "FP3": 0.45}
+# Long-run (race) pace: FP2 is when everyone does their race sim on race fuel,
+# so its long runs count fully; FP1/FP3 long runs are on unknown fuel and count less.
+RACE_SESSION_WEIGHTS = {"FP1": 0.5, "FP2": 1.0, "FP3": 0.6}
 FIRST_SEASON = 2021
-GRID_WEIGHT_DEFAULT = 25  # percent; adjustable in the sidebar
+GRID_WEIGHT_DEFAULT = 25        # percent, used when the circuit isn't in the table below
+MIN_LONG_RUN_DEFAULT = 8        # laps; a real race sim, not a short run
+FORM_WEIGHT_DEFAULT = 30        # percent of the final score that comes from recent results
+FORM_RACES_DEFAULT = 4          # how many previous races feed the form prior
+FORM_DECAY = 0.7                # each race further back counts 70% of the one after it
+CORRECTION_RACES_DEFAULT = 4    # races used to learn each team's practice-vs-quali gap
+CORRECTION_SHRINK = 1.0         # pseudo-races pulling the correction toward zero
+CORRECTION_LIMIT = 0.6          # max correction, % of lap time
+SIM_RUNS = 4000                 # simulated races for the podium probabilities
+SIM_NOISE = 0.6                 # race-day randomness, in score units (std devs)
+DNF_RATE = 0.08                 # chance any one car fails to finish in a simulated race
+
+# How much starting position matters, by circuit (percent). Street tracks and
+# narrow circuits high, long straights and DRS zones low.
+CIRCUIT_GRID_WEIGHT = [
+    (("monaco", "monte carlo"), 55),
+    (("budapest", "hungar"), 45),
+    (("marina bay", "singapore"), 45),
+    (("zandvoort", "dutch"), 45),
+    (("imola", "emilia"), 40),
+    (("barcelona", "catalunya", "spanish"), 35),
+    (("madrid",), 35),
+    (("suzuka", "japan"), 35),
+    (("melbourne", "australia"), 35),
+    (("yas", "abu dhabi"), 35),
+    (("miami",), 30),
+    (("mexico",), 30),
+    (("lusail", "qatar"), 30),
+    (("silverstone", "british"), 25),
+    (("montr", "canad"), 25),
+    (("shanghai", "chin"), 25),
+    (("austin", "united states", "cota"), 20),
+    (("monza", "italian"), 20),
+    (("jeddah", "saudi"), 20),
+    (("spielberg", "austria"), 20),
+    (("baku", "azerbaijan"), 15),
+    (("spa-francorchamps", "belgi"), 15),
+    (("sakhir", "bahrain"), 15),
+    (("las vegas",), 15),
+    (("paulo", "interlagos", "brazil"), 15),
+]
+
+# Track evolution inside a session: how much faster the track gets per minute, in
+# seconds, when this weekend's data isn't enough to measure it.
+EVOLUTION_DEFAULT = {"FP1": -0.020, "FP2": -0.012, "FP3": -0.008}
+EVOLUTION_LIMITS = (-0.06, 0.0)
 
 # Typical lap-time difference vs the medium tyre, in seconds per lap.
 # Used only when a weekend doesn't have enough mixed-compound runs to measure it.
 COMPOUND_DEFAULTS = {"SOFT": -0.5, "MEDIUM": 0.0, "HARD": 0.4}
 COMPOUND_LIMITS = {"SOFT": (-1.2, -0.1), "HARD": (0.1, 1.2)}
+COMPOUND_ORDER = {"SOFT": 0, "MEDIUM": 1, "HARD": 2}
 DRY_COMPOUNDS = set(COMPOUND_DEFAULTS)
+
+
+def circuit_grid_weight(event):
+    """Typical grid-position weight for this circuit, as a fraction."""
+    text = f"{event.get('Location', '')} {event.get('EventName', '')} {event.get('Country', '')}".lower()
+    for keys, pct in CIRCUIT_GRID_WEIGHT:
+        if any(k in text for k in keys):
+            return pct / 100
+    return GRID_WEIGHT_DEFAULT / 100
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -53,19 +114,25 @@ def selectable_events(year):
     return sched.loc[:last], int(nxt)
 
 
-def next_event(year):
+def completed_rounds(year):
+    """Schedule rows for races that have already finished this season, latest first."""
     sched = get_schedule(year)
-    date_col = "Session5DateUtc" if "Session5DateUtc" in sched.columns else "EventDate"
-    dates = pd.to_datetime(sched[date_col], utc=True, errors="coerce")
+    sched = sched[sched["RoundNumber"] > 0]
     now = pd.Timestamp.now(tz="UTC")
-    upcoming = sched[dates >= now]
-    if len(upcoming) == 0:
-        return sched.iloc[-1]
-    return upcoming.iloc[0]
+    done = []
+    for _, ev in sched.iterrows():
+        rd = session_date_for(ev, "Race")
+        if rd is None:
+            continue
+        rd = rd.tz_localize("UTC") if rd.tzinfo is None else rd.tz_convert("UTC")
+        if rd + pd.Timedelta(hours=3) < now:
+            done.append(ev)
+    return sorted(done, key=lambda e: -int(e["RoundNumber"]))
 
 
 LAP_COLUMNS = ["Driver", "Team", "LapTime", "LapNumber", "Stint", "Compound",
-               "TyreLife", "IsAccurate", "PitInTime", "PitOutTime", "LapSeconds", "TeamColor"]
+               "TyreLife", "IsAccurate", "PitInTime", "PitOutTime", "LapSeconds", "TeamColor",
+               "SessionTime"]
 
 
 class _LogCapture(logging.Handler):
@@ -97,6 +164,14 @@ def _load_fastf1_laps(year, round_number, session_name):
     if laps is None or laps.empty:
         raise ValueError("FastF1 loaded the session but it has no laps yet")
     laps["LapSeconds"] = laps["LapTime"].dt.total_seconds()
+    # seconds into the session when the lap started (for track-evolution correction)
+    try:
+        if "LapStartTime" in laps.columns:
+            laps["SessionTime"] = laps["LapStartTime"].dt.total_seconds()
+        else:
+            laps["SessionTime"] = (laps["Time"] - laps["LapTime"]).dt.total_seconds()
+    except Exception:
+        laps["SessionTime"] = np.nan
     laps["TeamColor"] = np.nan
     try:  # official live-timing team colour
         colours = session.results[["Abbreviation", "TeamColor"]].dropna()
@@ -133,6 +208,7 @@ def _load_openf1_laps(year, session_name, session_date_utc):
     if abs(pd.Timestamp(best["date_start"]).tz_convert("UTC") - target) > pd.Timedelta(days=2):
         raise ValueError("OpenF1 has not published this session yet")
     key = best["session_key"]
+    sess_start = pd.Timestamp(best["date_start"]).tz_convert("UTC")
 
     laps = pd.DataFrame(_openf1_get("laps", session_key=key))
     time.sleep(0.4)
@@ -166,6 +242,10 @@ def _load_openf1_laps(year, session_name, session_date_utc):
             laps.loc[(laps["driver_number"] == stn["driver_number"])
                      & (laps["lap_number"] == stn["lap_end"]), "PitInTime"] = 1
 
+    if "date_start" in laps.columns:
+        session_time = (pd.to_datetime(laps["date_start"], utc=True, errors="coerce") - sess_start).dt.total_seconds()
+    else:
+        session_time = pd.Series(np.nan, index=laps.index)
     out = pd.DataFrame({
         "Driver": laps["name_acronym"].fillna(laps["driver_number"].astype(str)),
         "Team": laps["team_name"].fillna("Unknown"),
@@ -177,6 +257,7 @@ def _load_openf1_laps(year, session_name, session_date_utc):
         "PitInTime": laps["PitInTime"],
         "PitOutTime": np.where(laps.get("is_pit_out_lap", False) == True, 1, np.nan),
         "LapSeconds": pd.to_numeric(laps["lap_duration"], errors="coerce"),
+        "SessionTime": session_time,
     })
     out["LapTime"] = pd.to_timedelta(out["LapSeconds"], unit="s")
     out["IsAccurate"] = out["LapSeconds"].notna() & out["PitOutTime"].isna()
@@ -192,10 +273,16 @@ def _result_fastf1(year, round_number, session_name):
     sess.load(laps=False, telemetry=False, weather=False, messages=False)
     res = sess.results[["Abbreviation", "Position"]].copy()
     res["Position"] = pd.to_numeric(res["Position"], errors="coerce")
+    # Classified = finished the race (or qualified). Retirements still get a
+    # Position in FastF1 but their ClassifiedPosition is a letter (R, D, ...).
+    if "ClassifiedPosition" in sess.results.columns:
+        res["Classified"] = pd.to_numeric(sess.results["ClassifiedPosition"], errors="coerce").notna()
+    else:
+        res["Classified"] = True
     res = res.dropna(subset=["Position"])
     if res.empty:
         raise ValueError(f"No {session_name} results yet")
-    return res.rename(columns={"Abbreviation": "Driver"})[["Driver", "Position"]]
+    return res.rename(columns={"Abbreviation": "Driver"})[["Driver", "Position", "Classified"]]
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -217,11 +304,16 @@ def _result_openf1(year, session_name, session_date_utc):
     drivers = drivers.drop_duplicates("driver_number")[["driver_number", "name_acronym"]]
     res = res.merge(drivers, on="driver_number", how="left")
     res["Position"] = pd.to_numeric(res["position"], errors="coerce")
+    flags = pd.Series(False, index=res.index)
+    for col in ("dnf", "dns", "dsq"):
+        if col in res.columns:
+            flags = flags | (res[col] == True)
+    res["Classified"] = ~flags
     res = res.dropna(subset=["Position"])
-    return res.rename(columns={"name_acronym": "Driver"})[["Driver", "Position"]]
+    return res.rename(columns={"name_acronym": "Driver"})[["Driver", "Position", "Classified"]]
 
 
-def load_session_result(year, round_number, event, session_name, done_after_hours):
+def load_session_result(year, round_number, event, session_name, done_after_hours, keep_classified=False):
     """Real classification for a finished session, or None. Tries FastF1 then OpenF1."""
     sdate = session_date_for(event, session_name)
     if sdate is None:
@@ -232,8 +324,10 @@ def load_session_result(year, round_number, event, session_name, done_after_hour
     for loader in (lambda: _result_fastf1(year, round_number, session_name),
                    lambda: _result_openf1(year, session_name, sdate.isoformat())):
         try:
-            res = loader()
-            return res.sort_values("Position").reset_index(drop=True)
+            res = loader().sort_values("Position").reset_index(drop=True)
+            if not keep_classified:
+                res = res.drop(columns="Classified")
+            return res
         except Exception:
             continue
     return None
@@ -337,8 +431,21 @@ def load_session_laps(year, round_number, session_name, event):
     return None, None, " || ".join(errors)
 
 
-def _stint_runs(session_laps, min_laps=5):
+# ---------- Model ----------
+def zscore(s):
+    """Standardise a series so different measures (gap %, grid slot, form) can be blended
+    while keeping how far apart the values are."""
+    s = pd.Series(s, dtype=float)
+    sd = s.std(ddof=0)
+    if not np.isfinite(sd) or sd == 0:
+        return s * 0.0
+    return (s - s.mean()) / sd
+
+
+def _stint_runs(session_laps, min_laps=MIN_LONG_RUN_DEFAULT):
     """Every clean run of at least min_laps laps, with pace corrected to 5-lap-old tyres.
+    Pace is the median lap of the run (one slow lap doesn't drag it). Degradation is only
+    measured on runs of 6+ laps; shorter runs get the field's typical value later.
     Returns (one row per run, one row per lap of those runs)."""
     rows = []
     lap_rows = []
@@ -356,10 +463,13 @@ def _stint_runs(session_laps, min_laps=5):
             grp = grp[grp["LapSeconds"] < med * 1.03]
             if len(grp) < min_laps:
                 continue
-            slope = np.polyfit(grp["TyreLife"].astype(float), grp["LapSeconds"], 1)[0]
-            slope = max(min(slope, 0.2), -0.05)
+            if len(grp) >= 6:
+                slope = np.polyfit(grp["TyreLife"].astype(float), grp["LapSeconds"], 1)[0]
+                slope = max(min(slope, 0.2), -0.05)
+            else:
+                slope = np.nan
             avg_age = grp["TyreLife"].mean()
-            corrected = grp["LapSeconds"].mean() - slope * (avg_age - 5)
+            corrected = grp["LapSeconds"].median() - (slope if np.isfinite(slope) else 0.0) * (avg_age - 5)
             compound = str(grp["Compound"].mode().iloc[0]).upper()
             rows.append({"Driver": drv, "Team": team, "Session": name, "Laps": len(grp),
                          "Compound": compound, "Pace": corrected, "DegPerLap": slope})
@@ -371,7 +481,10 @@ def _stint_runs(session_laps, min_laps=5):
             g["Run"] = f"{drv} {name} {compound.title()}"
             lap_rows.append(g)
     runlaps = pd.concat(lap_rows, ignore_index=True) if lap_rows else pd.DataFrame()
-    return pd.DataFrame(rows), runlaps
+    runs = pd.DataFrame(rows)
+    if not runs.empty and runs["DegPerLap"].notna().any():
+        runs["DegPerLap"] = runs["DegPerLap"].fillna(runs["DegPerLap"].median())
+    return runs, runlaps
 
 
 def estimate_compound_offsets(runs):
@@ -431,20 +544,73 @@ def _medium_equivalent(laps, offsets):
     return laps["LapSeconds"] - comp.map(offsets).fillna(0.0)
 
 
-def quali_projection(session_laps, offsets):
+def session_evolution(laps, offsets, default):
+    """How much faster the track got per minute during one session (seconds, negative =
+    faster). Measured from drivers who set two or more push laps at different times:
+    pace = driver + rate x minutes, fitted with least squares. Falls back to a typical
+    value when fewer than 4 drivers give usable pairs. Returns (rate, source)."""
+    if laps is None or laps.empty or "SessionTime" not in laps.columns:
+        return default, "typical"
+    d = laps[laps["Compound"].astype(str).str.upper().isin(DRY_COMPOUNDS)
+             & laps["LapSeconds"].notna() & laps["SessionTime"].notna()
+             & laps["PitInTime"].isna() & laps["PitOutTime"].isna()].copy()
+    if d.empty:
+        return default, "typical"
+    d["Adj"] = _medium_equivalent(d, offsets)
+    best = d.groupby("Driver")["Adj"].transform("min")
+    push = d[d["Adj"] <= best * 1.012].copy()  # push laps: within 1.2% of the driver's best
+    counts = push.groupby("Driver").size()
+    push = push[push["Driver"].isin(counts[counts >= 2].index)]
+    if push["Driver"].nunique() < 4:
+        return default, "typical"
+    spread = push.groupby("Driver")["SessionTime"].agg(lambda x: x.max() - x.min())
+    if spread.median() < 600:  # push laps need to be at least 10 minutes apart to say anything
+        return default, "typical"
+    y = push["Adj"] - push.groupby("Driver")["Adj"].transform("mean")
+    x = (push["SessionTime"] - push.groupby("Driver")["SessionTime"].transform("mean")) / 60.0
+    denom = float((x ** 2).sum())
+    if denom == 0:
+        return default, "typical"
+    rate = float((x * y).sum() / denom)
+    lo, hi = EVOLUTION_LIMITS
+    return min(max(rate, lo), hi), "measured"
+
+
+def session_best_gaps(laps, offsets=None, evolution_rate=None, softest_only=True):
+    """Best lap per driver in one session, as % gap to the session's fastest.
+    softest_only: use each driver's best lap on the softest tyre they ran (their quali
+    sim), not a medium lap set on heavy fuel. evolution_rate: s/min the track gained;
+    every lap is corrected to end-of-session conditions so early laps aren't penalised."""
+    if laps is None or laps.empty:
+        return None
+    dry = laps[laps["Compound"].astype(str).str.upper().isin(DRY_COMPOUNDS)
+               & laps["LapSeconds"].notna()].copy()
+    if dry.empty:
+        return None
+    dry["AdjSeconds"] = _medium_equivalent(dry, offsets) if offsets else dry["LapSeconds"]
+    if evolution_rate and "SessionTime" in dry.columns and dry["SessionTime"].notna().any():
+        t_end = dry["SessionTime"].max()
+        dry["AdjSeconds"] = dry["AdjSeconds"] + evolution_rate * (t_end - dry["SessionTime"]).fillna(0.0) / 60.0
+    if softest_only:
+        dry["_c"] = dry["Compound"].astype(str).str.upper().map(COMPOUND_ORDER)
+        dry = dry[dry["_c"] == dry.groupby("Driver")["_c"].transform("min")]
+    best = dry.loc[dry.groupby("Driver")["AdjSeconds"].idxmin(),
+                   ["Driver", "Team", "AdjSeconds", "Compound"]]
+    fastest = best["AdjSeconds"].min()
+    best["GapPct"] = (best["AdjSeconds"] - fastest) / fastest * 100
+    return best
+
+
+def quali_projection(session_laps, offsets, weights, evolution=None, softest_only=True):
+    """Practice-only single-lap ranking. Returns one row per driver with QualiScore
+    (weighted % gap to the fastest) and the per-session gaps."""
     rows = []
     for name, laps in session_laps.items():
-        if laps is None or laps.empty:
+        rate = evolution.get(name) if evolution else None
+        best = session_best_gaps(laps, offsets, rate, softest_only)
+        if best is None:
             continue
-        dry = laps[laps["Compound"].astype(str).str.upper().isin(DRY_COMPOUNDS)
-                   & laps["LapSeconds"].notna()].copy()
-        if dry.empty:
-            continue
-        dry["AdjSeconds"] = _medium_equivalent(dry, offsets)
-        best = dry.loc[dry.groupby("Driver")["AdjSeconds"].idxmin(),
-                       ["Driver", "Team", "AdjSeconds", "Compound"]]
-        fastest = best["AdjSeconds"].min()
-        best["GapPct"] = (best["AdjSeconds"] - fastest) / fastest * 100
+        best = best.copy()
         best["Session"] = name
         rows.append(best)
     if not rows:
@@ -454,7 +620,7 @@ def quali_projection(session_laps, offsets):
                                 values="GapPct").reset_index()
     score = pd.Series(0.0, index=pivot.index)
     total_w = pd.Series(0.0, index=pivot.index)
-    for s_, w in QUALI_WEIGHTS.items():
+    for s_, w in weights.items():
         if s_ in pivot.columns:
             has = pivot[s_].notna()
             score[has] += pivot.loc[has, s_] * w
@@ -465,27 +631,177 @@ def quali_projection(session_laps, offsets):
     return pivot
 
 
-def long_run_pace(runs, offsets, session_shift=None):
+def _prior_rounds(year, round_number, n_races):
+    """The n most recent completed races before this round, latest first. Reaches back
+    into the previous season (at reduced weight) early in the year.
+    Returns a list of (year, round, event row, weight scale)."""
+    out = []
+    try:
+        sched = get_schedule(year)
+        prior = sched[(sched["RoundNumber"] > 0) & (sched["RoundNumber"] < round_number)]
+        for _, ev in prior.sort_values("RoundNumber", ascending=False).iterrows():
+            out.append((year, int(ev["RoundNumber"]), ev, 1.0))
+            if len(out) >= n_races:
+                break
+    except Exception:
+        pass
+    if len(out) < n_races and year - 1 >= FIRST_SEASON:
+        try:
+            prev = get_schedule(year - 1)
+            prev = prev[prev["RoundNumber"] > 0].sort_values("RoundNumber", ascending=False)
+            for _, ev in prev.iterrows():
+                out.append((year - 1, int(ev["RoundNumber"]), ev, 0.6))
+                if len(out) >= n_races:
+                    break
+        except Exception:
+            pass
+    return out
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def recent_form(year, round_number, n_races):
+    """Each driver's weighted average finishing and qualifying position over the last
+    n races before this round. Recent races count more (FORM_DECAY). Retirements don't
+    count against a driver: a DNF is bad luck, not slow pace.
+    Returns a DataFrame (Driver, FormFinish, FormGrid, FormRaces) or None."""
+    race_rows, quali_rows = [], []
+    for i, (yr, rnd, ev, scale) in enumerate(_prior_rounds(year, round_number, n_races)):
+        w = scale * (FORM_DECAY ** i)
+        race = load_session_result(yr, rnd, ev, "Race", 3, keep_classified=True)
+        if race is not None:
+            race = race[race["Classified"]]
+            race_rows.append(pd.DataFrame({"Driver": race["Driver"], "Pos": race["Position"], "W": w}))
+        quali = load_session_result(yr, rnd, ev, "Qualifying", 1.5, keep_classified=True)
+        if quali is not None:
+            quali_rows.append(pd.DataFrame({"Driver": quali["Driver"], "Pos": quali["Position"], "W": w}))
+    if not race_rows and not quali_rows:
+        return None
+
+    def wavg(frames, col):
+        if not frames:
+            return pd.DataFrame(columns=["Driver", col, "N"])
+        df = pd.concat(frames)
+        df["WP"] = df["W"] * df["Pos"]
+        g = df.groupby("Driver").agg(WP=("WP", "sum"), W=("W", "sum"), N=("Pos", "size")).reset_index()
+        g[col] = g["WP"] / g["W"]
+        return g[["Driver", col, "N"]]
+
+    r = wavg(race_rows, "FormFinish").rename(columns={"N": "FormRaces"})
+    q = wavg(quali_rows, "FormGrid").drop(columns="N")
+    form = r.merge(q, on="Driver", how="outer")
+    form["FormRaces"] = form["FormRaces"].fillna(0).astype(int)
+    return form
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def team_quali_correction(year, round_number, n_races):
+    """How much each team's practice pace under- or over-states its qualifying pace,
+    learned from the last n races: (practice gap %) - (actual qualifying gap %), averaged
+    per team, centred on the field, recent races weighted more, shrunk toward zero and
+    capped. Positive = the team looks slower in practice than it qualifies (sandbagging).
+    Returns (dict team -> correction %, details DataFrame)."""
+    deltas = []  # one row per driver per race
+    used = 0
+    for yr, rnd, ev, scale in _prior_rounds(year, round_number, n_races + 2):
+        if used >= n_races:
+            break
+        practice = None
+        for sname in ("Practice 3", "Practice 2"):
+            laps, _, _ = load_session_laps(yr, rnd, sname, ev)
+            if laps is not None and not laps.empty:
+                practice = laps
+                break
+        if practice is None:
+            continue  # sprint weekend or no data: skip this race
+        qlaps, _, _ = load_session_laps(yr, rnd, "Qualifying", ev)
+        if qlaps is None or qlaps.empty:
+            continue
+        p = session_best_gaps(practice, None, None, softest_only=True)
+        q = session_best_gaps(qlaps[qlaps["IsAccurate"] == True], None, None, softest_only=False)
+        if p is None or q is None:
+            continue
+        m = p[["Driver", "Team", "GapPct"]].merge(q[["Driver", "GapPct"]], on="Driver",
+                                                    suffixes=("Practice", "Quali"))
+        if len(m) < 10:
+            continue
+        m["Delta"] = m["GapPctPractice"] - m["GapPctQuali"]
+        m["Delta"] = m["Delta"] - m["Delta"].mean()  # only the relative picture matters
+        m["W"] = scale * (FORM_DECAY ** used)
+        m["Race"] = f"{yr} R{rnd}"
+        deltas.append(m[["Team", "Delta", "W", "Race"]])
+        used += 1
+    if not deltas:
+        return {}, None
+    df = pd.concat(deltas)
+    df["WD"] = df["W"] * df["Delta"]
+    g = df.groupby("Team").agg(WD=("WD", "sum"), W=("W", "sum"), Races=("Race", "nunique")).reset_index()
+    g["Correction"] = (g["WD"] / (g["W"] + CORRECTION_SHRINK)).clip(-CORRECTION_LIMIT, CORRECTION_LIMIT)
+    g = g.sort_values("Correction", ascending=False)
+    return dict(zip(g["Team"], g["Correction"])), g[["Team", "Correction", "Races"]]
+
+
+def quali_blend(quali, correction=None, form=None, form_weight=0.0):
+    """Final qualifying projection: practice gap (team-corrected) blended with recent
+    qualifying form, both standardised. Keeps QualiScore in gap % for display."""
+    if quali is None:
+        return None
+    q = quali.copy()
+    if correction:
+        q["Correction"] = q["Team"].map(correction).fillna(0.0)
+        q["QualiScore"] = q["QualiScore"] - q["Correction"]
+        q["QualiScore"] = q["QualiScore"] - q["QualiScore"].min()
+    q["QualiZ"] = zscore(q["QualiScore"])
+    q["Blend"] = q["QualiZ"]
+    if form is not None and form_weight > 0 and "FormGrid" in form.columns:
+        q = q.merge(form[["Driver", "FormGrid"]], on="Driver", how="left")
+        fz = zscore(q["FormGrid"].dropna())
+        q["FormZ"] = np.nan
+        q.loc[fz.index, "FormZ"] = fz.values
+        q["FormZ"] = q["FormZ"].fillna(0.5)  # no recent results (rookie, new entry): a bit below average
+        q["Blend"] = (1 - form_weight) * q["QualiZ"] + form_weight * q["FormZ"]
+    q = q.sort_values("Blend").reset_index(drop=True)
+    q["ProjectedGrid"] = range(1, len(q) + 1)
+    return q
+
+
+def long_run_pace(runs, offsets, session_shift=None, session_weights=None):
+    """Race pace per driver from their best long runs, converted to medium-tyre, FP1
+    conditions. Each run is weighted by laps x session weight (FP2 race sims count most),
+    and the three best-weighted runs per driver are averaged."""
     if runs is None or runs.empty:
         return None
     runs = runs.copy()
     runs["Pace"] = runs["Pace"] - runs["Compound"].map(offsets).fillna(0.0)
     if session_shift:
         runs["Pace"] = runs["Pace"] - runs["Session"].map(session_shift).fillna(0.0)
-    best_runs = runs.sort_values("Laps", ascending=False).groupby("Driver").head(2)
-    agg = best_runs.groupby(["Driver", "Team"]).agg(
-        RacePace=("Pace", "mean"), DegPerLap=("DegPerLap", "mean"),
-        LongRunLaps=("Laps", "sum"),
-        Tyres=("Compound", lambda x: "/".join(sorted(set(x))))).reset_index()
-    fastest = agg["RacePace"].min()
-    agg["RaceGapPct"] = (agg["RacePace"] - fastest) / fastest * 100
-    return agg
+    sw = session_weights or {}
+    runs["W"] = runs["Laps"].astype(float) * runs["Session"].map(sw).fillna(1.0)
+    best_runs = runs.sort_values("W", ascending=False).groupby("Driver").head(3)
+
+    rows = []
+    for (drv, team), g in best_runs.groupby(["Driver", "Team"]):
+        w = g["W"].to_numpy(dtype=float)
+        deg = g["DegPerLap"].to_numpy(dtype=float)
+        ok = np.isfinite(deg)
+        rows.append({
+            "Driver": drv, "Team": team,
+            "RacePace": float(np.average(g["Pace"], weights=w)),
+            "DegPerLap": float(np.average(deg[ok], weights=w[ok])) if ok.any() else np.nan,
+            "LongRunLaps": int(g["Laps"].sum()),
+            "Tyres": "/".join(sorted(set(g["Compound"]))),
+        })
+    out = pd.DataFrame(rows)
+    fastest = out["RacePace"].min()
+    out["RaceGapPct"] = (out["RacePace"] - fastest) / fastest * 100
+    return out
 
 
-def race_projection(quali, pace, grid_weight, known_grid=None):
-    """Blends long-run pace with grid position. Uses the best grid available:
-    official starting grid (with penalties) > real qualifying > projected."""
-    if pace is None:
+def race_projection(quali, pace, grid_weight, known_grid=None, form=None, form_weight=0.0, legacy=False):
+    """Blends long-run pace, grid position and recent race form. Uses the best grid
+    available: official starting grid (with penalties) > real qualifying > projected.
+    Pace enters as the actual % gap (standardised), so a car 0.8% off is treated very
+    differently from one 0.05% off, even if they're neighbours in the order."""
+    if pace is None or pace.empty:
         return None
     if known_grid is not None:
         grid = known_grid.rename(columns={"Position": "ProjectedGrid"})[["Driver", "ProjectedGrid"]]
@@ -497,11 +813,169 @@ def race_projection(quali, pace, grid_weight, known_grid=None):
     if df["ProjectedGrid"].isna().all():
         df["ProjectedGrid"] = len(df)
     df["ProjectedGrid"] = df["ProjectedGrid"].fillna(df["ProjectedGrid"].max() + 1)
-    pace_rank = df["RaceGapPct"].rank()
-    df["RaceScore"] = (1 - grid_weight) * pace_rank + grid_weight * df["ProjectedGrid"]
+    if legacy:  # the original rank-based blend, kept for the backtest comparison
+        pace_rank = df["RaceGapPct"].rank()
+        df["RaceScore"] = (1 - grid_weight) * pace_rank + grid_weight * df["ProjectedGrid"]
+    else:
+        df["PaceZ"] = zscore(df["RaceGapPct"])
+        df["GridZ"] = zscore(df["ProjectedGrid"])
+        df["PracticeScore"] = (1 - grid_weight) * df["PaceZ"] + grid_weight * df["GridZ"]
+        df["RaceScore"] = df["PracticeScore"]
+        if form is not None and form_weight > 0 and "FormFinish" in form.columns:
+            df = df.merge(form[["Driver", "FormFinish", "FormRaces"]], on="Driver", how="left")
+            fz = zscore(df["FormFinish"].dropna())
+            df["FormZ"] = np.nan
+            df.loc[fz.index, "FormZ"] = fz.values
+            df["FormZ"] = df["FormZ"].fillna(0.5)
+            df["RaceScore"] = (1 - form_weight) * df["PracticeScore"] + form_weight * df["FormZ"]
     df = df.sort_values("RaceScore").reset_index(drop=True)
     df["ProjectedFinish"] = df.index + 1
     return df
+
+
+def simulate_race(race, n_runs=SIM_RUNS, noise=SIM_NOISE, dnf_rate=DNF_RATE, seed=7):
+    """Runs the race thousands of times with random race-day noise and retirements,
+    then counts how often each driver wins, makes the podium or finishes top 10."""
+    if race is None or race.empty or "RaceScore" not in race.columns:
+        return race
+    rng = np.random.default_rng(seed)
+    k = len(race)
+    base = race["RaceScore"].to_numpy(dtype=float)[:, None]
+    scores = base + rng.normal(0.0, noise, size=(k, n_runs))
+    dnf = rng.random(size=(k, n_runs)) < dnf_rate
+    scores = np.where(dnf, scores + 50.0, scores)
+    ranks = scores.argsort(axis=0).argsort(axis=0) + 1
+    out = race.copy()
+    out["WinPct"] = (ranks == 1).mean(axis=1) * 100
+    out["PodiumPct"] = (ranks <= 3).mean(axis=1) * 100
+    out["Top10Pct"] = (ranks <= 10).mean(axis=1) * 100
+    out["ExpectedFinish"] = ranks.mean(axis=1)
+    return out
+
+
+def score_prediction(pred, pred_col, actual, actual_col):
+    """Scores a predicted order against the real one.
+    Returns dict: top1 hit, top-3 hits (0-3), exact top-3 slots, mean abs position error,
+    Spearman rank correlation."""
+    if pred is None or actual is None or pred.empty or actual.empty:
+        return None
+    p = pred[["Driver", pred_col]].dropna()
+    a = actual[["Driver", actual_col]].dropna()
+    m = p.merge(a, on="Driver", how="inner")
+    if len(m) < 5:
+        return None
+    pred_top3 = list(p.sort_values(pred_col)["Driver"].head(3))
+    real_top3 = list(a.sort_values(actual_col)["Driver"].head(3))
+    return {
+        "Top1": pred_top3[0] == real_top3[0],
+        "Top3Hits": len(set(pred_top3) & set(real_top3)),
+        "Top3Exact": sum(x == y for x, y in zip(pred_top3, real_top3)),
+        "MAE": float((m[pred_col] - m[actual_col]).abs().mean()),
+        "Spearman": float(m[pred_col].corr(m[actual_col], method="spearman")),
+        "Drivers": len(m),
+    }
+
+
+ALL_FP = {"FP1": "Practice 1", "FP2": "Practice 2", "FP3": "Practice 3"}
+
+# Settings of the original model, for the backtest comparison
+BASELINE_SETTINGS = {"legacy": True, "min_laps": 5, "grid_weight": 0.25, "form_weight": 0.0,
+                     "form_races": 0, "correction": False, "correction_races": 0, "evolution": False}
+
+
+def run_model(year, round_number, event, s):
+    """Runs the whole pipeline for one race weekend with settings dict s and returns
+    everything the UI and the backtest need. Shared so both score the same way."""
+    legacy = s.get("legacy", False)
+    sess_map = {k: v for k, v in ALL_FP.items() if k in s["fp"]}
+    session_laps, load_errors, sources = {}, {}, {}
+    for short, full in sess_map.items():
+        laps, src, err = load_session_laps(year, round_number, full, event)
+        session_laps[short] = laps
+        if err:
+            load_errors[short] = err
+        else:
+            sources[short] = src
+    available = [k for k, v in session_laps.items() if v is not None and not v.empty]
+    out = {"sess_map": sess_map, "load_errors": load_errors, "sources": sources,
+           "available": available, "session_laps": session_laps, "quali": None, "race": None,
+           "actual_quali": None, "actual": None, "no_compound_laps": False}
+    if not available:
+        return out
+
+    session_laps_all = dict(session_laps)
+    session_laps = {
+        k: (v[v["Compound"].astype(str).str.upper().isin(s["compounds"])] if v is not None else None)
+        for k, v in session_laps.items()
+    }
+    out["session_laps_all"] = session_laps_all
+    out["session_laps"] = session_laps
+    if all(v is None or v.empty for v in session_laps.values()):
+        out["no_compound_laps"] = True
+        return out
+
+    runs, runlaps = _stint_runs(session_laps, s["min_laps"])
+    runs_all, runlaps_all = _stint_runs(session_laps_all, s["min_laps"])
+    offsets_all, _, shift_all = estimate_compound_offsets(runs_all)
+    compound_offsets, compound_source, session_shift = estimate_compound_offsets(runs)
+
+    evolution, evo_source = {}, {}
+    if s["evolution"] and not legacy:
+        for name, laps in session_laps.items():
+            rate, src = session_evolution(laps, compound_offsets, EVOLUTION_DEFAULT.get(name, -0.01))
+            evolution[name], evo_source[name] = rate, src
+
+    quali_raw = quali_projection(session_laps, compound_offsets,
+                                 QUALI_WEIGHTS_LEGACY if legacy else QUALI_WEIGHTS,
+                                 evolution or None, softest_only=not legacy)
+    form = None
+    if s["form_weight"] > 0 and not legacy:
+        try:
+            form = recent_form(year, round_number, s["form_races"])
+        except Exception:
+            form = None
+    correction, correction_details = {}, None
+    if s["correction"] and not legacy:
+        try:
+            correction, correction_details = team_quali_correction(year, round_number, s["correction_races"])
+        except Exception:
+            correction, correction_details = {}, None
+    quali = quali_raw if legacy else quali_blend(quali_raw, correction or None, form, s["form_weight"])
+    pace = long_run_pace(runs, compound_offsets, session_shift, None if legacy else RACE_SESSION_WEIGHTS)
+
+    actual_quali = load_session_result(year, round_number, event, "Qualifying", 1.5)
+    official_grid = load_starting_grid(year, round_number, event) if actual_quali is not None else None
+    race_notes = load_race_notes(year, round_number)
+    announced_drops = race_notes.get("grid_drops", {}) or {}
+    if official_grid is not None:
+        known_grid = official_grid
+    elif actual_quali is not None and announced_drops:
+        known_grid = apply_grid_drops(actual_quali, announced_drops)
+    else:
+        known_grid = actual_quali
+    grid_weight = s["grid_weight"] if s["grid_weight"] is not None else circuit_grid_weight(event)
+    race = race_projection(quali, pace, grid_weight, known_grid, form, s["form_weight"], legacy)
+    if race is not None and not legacy:
+        race = simulate_race(race)
+
+    actual = load_session_result(year, round_number, event, "Race", 3)
+    if actual is not None:
+        actual = actual.rename(columns={"Position": "ActualFinish"})
+    if race is not None and actual is not None:
+        race = race.merge(actual, on="Driver", how="left")
+
+    out.update({
+        "runs": runs, "runlaps": runlaps, "runs_all": runs_all, "runlaps_all": runlaps_all,
+        "offsets_all": offsets_all, "shift_all": shift_all,
+        "compound_offsets": compound_offsets, "compound_source": compound_source,
+        "session_shift": session_shift, "evolution": evolution, "evo_source": evo_source,
+        "quali_raw": quali_raw, "quali": quali, "form": form,
+        "correction": correction, "correction_details": correction_details,
+        "pace": pace, "actual_quali": actual_quali, "official_grid": official_grid,
+        "announced_drops": announced_drops, "known_grid": known_grid,
+        "grid_weight": grid_weight, "race": race, "actual": actual,
+    })
+    return out
 
 
 @st.cache_data(ttl=7 * 86400, show_spinner=False)
@@ -823,6 +1297,7 @@ def apply_palette():
     [data-testid="stSidebar"] [data-testid="stSliderTickBarMax"],
     [data-testid="stSidebar"] [data-testid="stThumbValue"] {{ color: {p['mint']} !important; }}
     [data-testid="stSidebar"] [role="radio"] > div:first-child {{ border-color: {p['mint']} !important; }}
+    [data-testid="stSidebar"] [role="checkbox"] {{ border-color: {p['mint']} !important; }}
     [data-testid="stSidebarCollapseButton"] svg, [data-testid="stSidebarHeader"] svg {{ fill: {p['mint']}; color: {p['mint']}; }}
     h1 {{ border-bottom: 3px solid {p['leaf']}; padding-bottom: .3rem; }}
     [data-testid="stSidebar"] {{ border-right: 2px solid {p['leaf']}; }}
@@ -856,6 +1331,7 @@ def apply_palette():
     }}
     .stButton > button:hover {{ background: {p['leaf']}; color: #ffffff; }}
     [data-testid="stExpander"] details {{ border-color: {p['leaf']} !important; }}
+    [data-testid="stProgress"] > div > div > div > div {{ background-color: {p['forest']} !important; }}
     </style>""", unsafe_allow_html=True)
 
 
@@ -918,7 +1394,8 @@ labels = [f"R{int(r.RoundNumber)} – {r.EventName}" for r in events.itertuples(
 pick = st.sidebar.selectbox("Track", range(len(labels)), index=default_idx,
                             format_func=lambda i: labels[i])
 event = events.iloc[pick]
-race_notes = load_race_notes(year, int(event["RoundNumber"]))
+round_number = int(event["RoundNumber"])
+race_notes = load_race_notes(year, round_number)
 if not race_notes.get("strategy"):
     auto = pirelli_strategy(year, event)
     if auto:
@@ -950,44 +1427,58 @@ FP_CHOICES = {
     "FP2 + FP3": ["FP2", "FP3"],
 }
 fp_pick = st.sidebar.radio("Practice data to use", list(FP_CHOICES.keys()), index=0,
-                           help="Only the selected sessions feed the qualifying and race projections.")
+                           help="Only the selected sessions feed the projections. Qualifying pace "
+                                "leans on FP3, race pace on FP2's long runs.")
 selected_fp = FP_CHOICES[fp_pick]
 
-
 min_long_run = st.sidebar.slider(
-    "Minimum long-run length (laps)", 3, 15, 5,
+    "Minimum long-run length (laps)", 3, 15, MIN_LONG_RUN_DEFAULT,
     help="A run on one set of tyres needs at least this many clean laps to count as a long run. "
-         "Higher = closer to race conditions but fewer drivers qualify.")
+         "8+ is a real race sim; lower it if too few drivers show up in the race projection.")
 
-grid_weight = st.sidebar.slider(
-    "Grid position weight", 0, 60, GRID_WEIGHT_DEFAULT, step=5, format="%d%%",
-    help="How much the projected qualifying position counts in the race prediction. "
-         "0% means race prediction uses practice long-run pace only.") / 100
+auto_gw = circuit_grid_weight(event)
+with st.sidebar.expander("Model tuning", expanded=False):
+    grid_weight = st.slider(
+        "Grid position weight", 0, 60, int(round(auto_gw * 100)), step=5, format="%d%%",
+        key=f"gw_{year}_{round_number}",
+        help="How much starting position counts in the race prediction. Starts at the typical "
+             "value for this circuit (high at Monaco and Hungary, low at Spa and Baku). "
+             "0% = practice long-run pace only.") / 100
+    form_weight = st.slider(
+        "Recent form weight", 0, 60, FORM_WEIGHT_DEFAULT, step=5, format="%d%%",
+        help="How much the last few races' results count versus this weekend's practice data. "
+             "Practice is noisy; form steadies it. 0% = practice only.") / 100
+    history_races = st.slider(
+        "Races of history to use", 2, 8, FORM_RACES_DEFAULT,
+        help="Previous races used for recent form and for the team practice correction. "
+             "The most recent race counts most. Early in the season this reaches back into last year.")
+    use_correction = st.checkbox(
+        "Team practice correction", True,
+        help="Learns which teams look slower in practice than they qualify (sandbagging) from the "
+             "last few races and corrects for it. Slower first load: it downloads FP3 and "
+             "qualifying laps for those races.")
+    use_evolution = st.checkbox(
+        "Track evolution correction", True,
+        help="Corrects every lap to end-of-session grip, so a quick lap set early in a session "
+             "isn't punished for a green track.")
 if st.sidebar.button("🔄 Refresh data"):
     st.cache_data.clear()
     st.rerun()
 
-round_number = int(event["RoundNumber"])
+settings = {"fp": selected_fp, "compounds": selected_compounds, "min_laps": min_long_run,
+            "grid_weight": grid_weight, "form_weight": form_weight, "form_races": history_races,
+            "correction": use_correction, "correction_races": history_races,
+            "evolution": use_evolution, "legacy": False}
+
 set_track_background(event, year)
 circuit = event["Location"]
 st.subheader(f"{event['EventName']} – {year}, Round {round_number}")
 st.caption(f"{circuit}, {event['Country']}")
 
-ALL_FP = {"FP1": "Practice 1", "FP2": "Practice 2", "FP3": "Practice 3"}
-sess_map = {k: v for k, v in ALL_FP.items() if k in selected_fp}
-session_laps = {}
-load_errors = {}
-sources = {}
-with st.spinner("Loading practice data..."):
-    for short, full in sess_map.items():
-        laps, src, err = load_session_laps(year, round_number, full, event)
-        session_laps[short] = laps
-        if err:
-            load_errors[short] = err
-        else:
-            sources[short] = src
+with st.spinner("Loading practice data and recent results..."):
+    m = run_model(year, round_number, event, settings)
 
-available = [k for k, v in session_laps.items() if v is not None and not v.empty]
+sess_map, load_errors, sources, available = m["sess_map"], m["load_errors"], m["sources"], m["available"]
 
 with st.sidebar.expander("Diagnostics", expanded=not available):
     st.write(f"FastF1 version: {fastf1.__version__}")
@@ -1005,7 +1496,19 @@ with st.sidebar.expander("Diagnostics", expanded=not available):
         if short in load_errors:
             st.error(f"{short}: {load_errors[short]}")
         else:
-            st.success(f"{short}: {len(session_laps[short])} laps from {sources[short]}")
+            st.success(f"{short}: {len(m['session_laps'][short])} laps from {sources[short]}")
+    if m.get("evolution"):
+        st.write("Track evolution (s/min): " + ", ".join(
+            f"{k} {v:+.3f} ({m['evo_source'][k]})" for k, v in m["evolution"].items()))
+    if m.get("form") is not None:
+        st.write(f"Recent form: {len(m['form'])} drivers with results")
+    elif settings["form_weight"] > 0 and available:
+        st.warning("Recent form: no previous results could be loaded, so form is not being used.")
+    if settings["correction"] and available:
+        if m.get("correction"):
+            st.write(f"Team practice correction: {len(m['correction'])} teams")
+        else:
+            st.warning("Team practice correction: could not be learned (no previous practice + qualifying laps), so none applied.")
 
 if not available:
     st.warning("No practice data loaded for this race. Open Diagnostics in the sidebar "
@@ -1018,35 +1521,22 @@ data_lines.append("Sessions: " + ", ".join(available))
 if not selected_compounds:
     st.warning("Pick a tyre type in Settings.")
     st.stop()
-session_laps_all = dict(session_laps)  # every compound, for the Long runs tab
-# keep only laps on the chosen compounds
-session_laps = {
-    k: (v[v["Compound"].astype(str).str.upper().isin(selected_compounds)] if v is not None else None)
-    for k, v in session_laps.items()
-}
-if all(v is None or v.empty for v in session_laps.values()):
+if m["no_compound_laps"]:
     st.warning("No laps on the selected tyre type in these sessions. Try another option under Tyre type.")
     st.stop()
 data_lines.append("Tyres: " + ", ".join(c.title() for c in ("SOFT", "MEDIUM", "HARD")
                                           if c in selected_compounds))
 
-runs, runlaps = _stint_runs(session_laps, min_long_run)
-runs_all, runlaps_all = _stint_runs(session_laps_all, min_long_run)
-offsets_all, _, shift_all = estimate_compound_offsets(runs_all)
-TEAM_COLOURS = team_colour_map(session_laps_all)
-compound_offsets, compound_source, session_shift = estimate_compound_offsets(runs)
-quali = quali_projection(session_laps, compound_offsets)
-pace = long_run_pace(runs, compound_offsets, session_shift)
-actual_quali = load_session_result(year, round_number, event, "Qualifying", 1.5)
-official_grid = load_starting_grid(year, round_number, event) if actual_quali is not None else None
-announced_drops = race_notes.get("grid_drops", {}) or {}
-if official_grid is not None:
-    known_grid = official_grid
-elif actual_quali is not None and announced_drops:
-    known_grid = apply_grid_drops(actual_quali, announced_drops)
-else:
-    known_grid = actual_quali
-race = race_projection(quali, pace, grid_weight, known_grid)
+runs_all, runlaps_all = m["runs_all"], m["runlaps_all"]
+offsets_all, shift_all = m["offsets_all"], m["shift_all"]
+compound_offsets, compound_source, session_shift = m["compound_offsets"], m["compound_source"], m["session_shift"]
+evolution = m["evolution"]
+quali, race, pace = m["quali"], m["race"], m["pace"]
+actual_quali, official_grid, known_grid = m["actual_quali"], m["official_grid"], m["known_grid"]
+announced_drops, actual = m["announced_drops"], m["actual"]
+form, correction, correction_details = m["form"], m["correction"], m["correction_details"]
+grid_weight = m["grid_weight"]
+TEAM_COLOURS = team_colour_map(m["session_laps_all"])
 
 # drivers whose start slot differs from where they qualified (penalties, pit-lane starts)
 grid_changes = None
@@ -1069,12 +1559,6 @@ elif actual_quali is not None and announced_drops:
     gc = gc[gc["Driver"].isin(announced_drops.keys())]
     grid_changes = gc.sort_values("Change", ascending=False) if not gc.empty else None
 
-actual = load_session_result(year, round_number, event, "Race", 3)
-if actual is not None:
-    actual = actual.rename(columns={"Position": "ActualFinish"})
-if race is not None and actual is not None:
-    race = race.merge(actual, on="Driver", how="left")
-
 if official_grid is not None:
     grid_label = "Grid (official, with penalties)"
     data_lines.append("Grid: official FIA grid, with penalties")
@@ -1087,7 +1571,19 @@ elif actual_quali is not None:
 else:
     grid_label = "Projected grid"
     data_lines.append("Grid: projected from practice")
-data_lines.append(f"Long runs: {min_long_run}+ laps · Grid weight: {grid_weight:.0%}")
+gw_note = " (circuit default)" if abs(grid_weight - auto_gw) < 1e-9 else ""
+data_lines.append(f"Long runs: {min_long_run}+ laps, FP2 counts most · Grid weight: {grid_weight:.0%}{gw_note}")
+if form is not None and form_weight > 0:
+    data_lines.append(f"Recent form: last {history_races} races at {form_weight:.0%}")
+else:
+    data_lines.append("Recent form: off")
+if correction:
+    data_lines.append(f"Team practice correction: on ({len(correction)} teams)")
+else:
+    data_lines.append("Team practice correction: off")
+if evolution:
+    measured = [k for k, v in m["evo_source"].items() if v == "measured"]
+    data_lines.append("Track evolution: " + (f"measured in {', '.join(measured)}" if measured else "typical values"))
 
 with data_box:
     for line in data_lines:
@@ -1137,7 +1633,7 @@ with right:
         for note in race_notes.get("penalty_notes", []):
             st.caption(note)
 
-tab1, tab2, tab3, tab4 = st.tabs(["🏆 Podium", "⏱️ Qualifying", "🏎️ Race", "📈 Long runs"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["🏆 Podium", "⏱️ Qualifying", "🏎️ Race", "📈 Long runs", "📊 Backtest"])
 
 with tab1:
     if race is None or race.empty:
@@ -1146,25 +1642,57 @@ with tab1:
         top3 = race.head(3)
         cols = st.columns(3)
         medals = ["🥇 P1", "🥈 P2", "🥉 P3"]
-        for c, m, (_, r) in zip(cols, medals, top3.iterrows()):
-            podium_card(c, m, r["Driver"], r["Team"])
-        st.caption(f"Predicted podium. Grid position weight: {grid_weight:.0%}")
+        for c, mdl, (_, r) in zip(cols, medals, top3.iterrows()):
+            note = f"{r['PodiumPct']:.0f}% podium · {r['WinPct']:.0f}% win" if "PodiumPct" in race.columns else None
+            podium_card(c, mdl, r["Driver"], r["Team"], note, True)
+        st.caption(f"Predicted podium from {SIM_RUNS:,} simulated races. Grid weight {grid_weight:.0%}, "
+                   f"recent form {form_weight:.0%}.")
         if actual is not None:
             st.markdown("**Actual podium**")
             real = actual.sort_values("ActualFinish").head(3)
             acols = st.columns(3)
             pred3 = set(top3["Driver"])
             team_of = dict(zip(race["Driver"], race["Team"]))
-            for c, m, (_, r) in zip(acols, medals, real.iterrows()):
+            for c, mdl, (_, r) in zip(acols, medals, real.iterrows()):
                 ok = r["Driver"] in pred3
-                podium_card(c, m, r["Driver"], team_of.get(r["Driver"], ""),
+                podium_card(c, mdl, r["Driver"], team_of.get(r["Driver"], ""),
                             "✓ predicted" if ok else "✗ missed", ok)
             hits = len(pred3 & set(real["Driver"]))
             exact = sum(a == b for a, b in zip(top3["Driver"], real["Driver"]))
             result_banner(f"{hits} of 3 podium drivers predicted, "
                           f"<span style='color:{PALETTE['mint']};'>{exact} in the exact position</span>.")
+        if "PodiumPct" in race.columns:
+            st.markdown("**Podium odds**")
+            odds = race[["Driver", "Team", "WinPct", "PodiumPct", "Top10Pct", "ExpectedFinish"]].head(10).copy()
+            for col in ("WinPct", "PodiumPct", "Top10Pct"):
+                odds[col] = odds[col].round(0).astype(int).astype(str) + "%"
+            odds["ExpectedFinish"] = odds["ExpectedFinish"].round(1)
+            show_table(odds.rename(columns={"WinPct": "Win", "PodiumPct": "Podium", "Top10Pct": "Top 10",
+                                            "ExpectedFinish": "Avg finish"}))
+            fig = px.bar(race.head(10), x="Driver", y="PodiumPct", color="Team",
+                         color_discrete_map=TEAM_COLOURS, labels={"PodiumPct": "Podium chance (%)"},
+                         title="Podium chance")
+            fig.update_layout(showlegend=False)
+            st.plotly_chart(style_fig(fig), use_container_width=True, theme=None)
 
 with tab2:
+    def quali_table(q):
+        cols = ["ProjectedGrid", "Driver", "Team", "QualiScore"]
+        names = {"QualiScore": "Practice gap (%)"}
+        if "Correction" in q.columns and (q["Correction"] != 0).any():
+            cols.append("Correction")
+            names["Correction"] = "Team correction (%)"
+        if "FormGrid" in q.columns and q["FormGrid"].notna().any():
+            cols.append("FormGrid")
+            names["FormGrid"] = "Form avg quali"
+        show = q[cols].copy()
+        show["QualiScore"] = show["QualiScore"].round(3)
+        if "Correction" in show.columns:
+            show["Correction"] = show["Correction"].round(2)
+        if "FormGrid" in show.columns:
+            show["FormGrid"] = show["FormGrid"].round(1)
+        return show.rename(columns=names)
+
     if actual_quali is not None:
         st.markdown("**Actual qualifying result**")
         aq = actual_quali.copy()
@@ -1182,21 +1710,25 @@ with tab2:
         show_table(aq.rename(columns={"Position": "Actual"}))
         if quali is not None:
             with st.expander("Show the practice-based projection"):
-                show = quali[["ProjectedGrid", "Driver", "Team", "QualiScore"]].copy()
-                show["QualiScore"] = show["QualiScore"].round(3)
-                show_table(show.rename(columns={"QualiScore": "Avg gap to best (%)"}))
+                show_table(quali_table(quali))
     elif quali is None:
         st.write("No qualifying projection available.")
     else:
-        show = quali[["ProjectedGrid", "Driver", "Team", "QualiScore"]].copy()
-        show["QualiScore"] = show["QualiScore"].round(3)
-        show = show.rename(columns={"QualiScore": "Avg gap to best (%)"})
-        show_table(show)
-        st.caption("Gaps are tyre-adjusted to medium-equivalent lap times (see Race tab for the values).")
+        show_table(quali_table(quali))
+        st.caption("Practice gap = each driver's best lap on their softest tyre, converted to medium-equivalent "
+                   "and corrected for track evolution, weighted FP3 > FP2 > FP1. Order blends that with "
+                   "recent qualifying form.")
         fig = px.bar(quali, x="Driver", y="QualiScore", color="Team",
                      color_discrete_map=TEAM_COLOURS,
                      title="Projected qualifying gap to fastest (%)")
         st.plotly_chart(style_fig(fig), use_container_width=True, theme=None)
+    if correction_details is not None and correction:
+        with st.expander("Team practice correction"):
+            st.write("Positive = the team has been qualifying better than its practice pace suggested "
+                     f"over the last {history_races} races, so its practice gap is reduced by this much.")
+            cd = correction_details.copy()
+            cd["Correction"] = cd["Correction"].round(2)
+            show_table(cd.rename(columns={"Correction": "Correction (% of lap)", "Races": "Races used"}))
 
 with tab3:
     if race is None or race.empty:
@@ -1205,7 +1737,12 @@ with tab3:
         cols_shown = ["ProjectedFinish", "Driver", "Team", "ProjectedGrid"]
         if "ActualFinish" in race.columns:
             cols_shown.append("ActualFinish")
-        cols_shown += ["RaceGapPct", "DegPerLap", "LongRunLaps", "Tyres"]
+        cols_shown += ["RaceGapPct"]
+        if "FormFinish" in race.columns:
+            cols_shown.append("FormFinish")
+        if "PodiumPct" in race.columns:
+            cols_shown.append("PodiumPct")
+        cols_shown += ["DegPerLap", "LongRunLaps", "Tyres"]
         show = race[cols_shown].copy()
         if "ActualFinish" in show.columns:
             show["ActualFinish"] = show["ActualFinish"].astype("Int64")
@@ -1214,11 +1751,20 @@ with tab3:
         show = show.rename(columns={"ProjectedGrid": grid_label})
         show["RaceGapPct"] = show["RaceGapPct"].round(3)
         show["DegPerLap"] = show["DegPerLap"].round(3)
+        if "FormFinish" in show.columns:
+            show["FormFinish"] = show["FormFinish"].round(1)
+        if "PodiumPct" in show.columns:
+            show["PodiumPct"] = show["PodiumPct"].round(0).astype(int).astype(str) + "%"
         show = show.rename(columns={"RaceGapPct": "Long-run gap (%)",
+                                    "FormFinish": "Form avg finish",
+                                    "PodiumPct": "Podium",
                                     "DegPerLap": "Tyre deg (s/lap)",
                                     "LongRunLaps": "Long-run laps"})
         show_table(show)
-        with st.expander("Tyre compound adjustment"):
+        st.caption("Order = long-run pace gap (not just rank) blended with grid position at "
+                   f"{grid_weight:.0%} and recent race form at {form_weight:.0%}. FP2 long runs count "
+                   "fully; FP1/FP3 long runs count about half, since fuel loads there are unknown.")
+        with st.expander("Tyre compound and track adjustments"):
             st.write("All lap times are converted to medium-tyre equivalents before comparing.")
             show_table(pd.DataFrame([
                 {"Compound": c.title(), "Seconds vs medium": f"{compound_offsets[c]:+.2f}",
@@ -1226,8 +1772,11 @@ with tab3:
             st.caption("Measured = learned from drivers who ran more than one compound this weekend. "
                        "Typical = not enough data, so a standard value is used.")
             if session_shift:
-                st.write("Track evolution correction (long runs, vs the first session used): " +
+                st.write("Session-to-session track improvement (long runs, vs the first session used): " +
                          ", ".join(f"{k} {v:+.2f}s" for k, v in session_shift.items()))
+            if evolution:
+                st.write("Within-session track evolution (seconds gained per minute): " +
+                         ", ".join(f"{k} {v:+.3f} ({m['evo_source'][k]})" for k, v in evolution.items()))
         fig = px.scatter(race, x="RaceGapPct", y="DegPerLap", text="Driver",
                          color="Team", color_discrete_map=TEAM_COLOURS,
                          title="Long-run pace vs tyre degradation")
@@ -1306,7 +1855,7 @@ with tab4:
             deg = runs_all[runs_all["Driver"].isin(picked) & runs_all["Compound"].isin(tyres_pick)]
             if sess_pick != "All":
                 deg = deg[deg["Session"] == sess_pick]
-            if not deg.empty:
+            if not deg.empty and deg["DegPerLap"].notna().any():
                 deg = deg.groupby(["Driver", "Team"])["DegPerLap"].mean().reset_index()
                 deg = deg.sort_values("DegPerLap")
                 fig3 = px.bar(deg, x="Driver", y="DegPerLap", color="Team",
@@ -1315,5 +1864,87 @@ with tab4:
                               title="Tyre degradation (lower is better)")
                 fig3.update_layout(showlegend=False)
                 st.plotly_chart(style_fig(fig3), use_container_width=True, theme=None)
+
+with tab5:
+    st.markdown("#### How accurate is the model?")
+    st.write("Re-runs the prediction for past races this season and scores it against what actually "
+             "happened. Qualifying is scored from practice only. The race is scored the way the app "
+             "works after qualifying: real grid, practice long runs, recent form.")
+    done_rounds = completed_rounds(year)
+    if not done_rounds:
+        st.write("No completed races this season yet.")
+    else:
+        n_test = st.slider("Races to test (most recent first)", 1, len(done_rounds), min(5, len(done_rounds)))
+        compare = st.checkbox("Also score the previous model (rank blend, 25% grid, 5-lap runs, no form or team correction)", True)
+        st.caption("Uses your current Settings. Each race's form and team correction only use races before it, "
+                   "so nothing leaks from the result being tested. The first run downloads practice data for "
+                   "every race tested, so it can take a few minutes.")
+        if st.button("Run backtest"):
+            prog = st.progress(0.0)
+            status = st.empty()
+            rows = []
+            test_settings = dict(settings)
+            test_settings["grid_weight"] = None if gw_note else settings["grid_weight"]  # auto-by-circuit unless overridden
+            base_settings = {**BASELINE_SETTINGS, "fp": settings["fp"], "compounds": settings["compounds"]}
+            for i, ev in enumerate(done_rounds[:n_test]):
+                rnd = int(ev["RoundNumber"])
+                status.write(f"Scoring {ev['EventName']} ({i + 1} of {n_test})...")
+                for label_, cfg in ((("This model", test_settings),) + ((("Previous model", base_settings),) if compare else ())):
+                    row = {"Model": label_, "Round": rnd, "Race": ev["EventName"]}
+                    try:
+                        mm = run_model(year, rnd, ev, cfg)
+                        qs = score_prediction(mm["quali"], "ProjectedGrid", mm["actual_quali"], "Position")
+                        rs = score_prediction(mm["race"], "ProjectedFinish", mm["actual"], "ActualFinish")
+                        if qs:
+                            row.update({"Pole": qs["Top1"], "Q top3 hits": qs["Top3Hits"],
+                                        "Q avg error": qs["MAE"], "Q correlation": qs["Spearman"]})
+                        if rs:
+                            row.update({"Winner": rs["Top1"], "Podium hits": rs["Top3Hits"],
+                                        "Podium exact": rs["Top3Exact"], "R avg error": rs["MAE"],
+                                        "R correlation": rs["Spearman"]})
+                        if not qs and not rs:
+                            row["Note"] = "no data"
+                    except Exception as e:
+                        row["Note"] = f"{type(e).__name__}: {e}"
+                    rows.append(row)
+                prog.progress((i + 1) / n_test)
+            status.empty()
+            st.session_state["backtest"] = pd.DataFrame(rows)
+            st.session_state["backtest_year"] = year
+
+        bt = st.session_state.get("backtest")
+        if bt is not None and st.session_state.get("backtest_year") == year and not bt.empty:
+            summary_rows = []
+            for label_, g in bt.groupby("Model", sort=False):
+                def pct(col):
+                    return f"{g[col].mean() * 100:.0f}%" if col in g.columns and g[col].notna().any() else "–"
+
+                def avg(col, nd=2):
+                    return round(g[col].mean(), nd) if col in g.columns and g[col].notna().any() else "–"
+                summary_rows.append({
+                    "Model": label_,
+                    "Races": int(g["Pole"].notna().sum()) if "Pole" in g.columns else 0,
+                    "Pole right": pct("Pole"), "Quali top-3 hits (of 3)": avg("Q top3 hits"),
+                    "Quali avg error (places)": avg("Q avg error", 1),
+                    "Winner right": pct("Winner"), "Podium hits (of 3)": avg("Podium hits"),
+                    "Podium exact (of 3)": avg("Podium exact"),
+                    "Race avg error (places)": avg("R avg error", 1),
+                    "Race correlation": avg("R correlation"),
+                })
+            st.markdown("**Summary**")
+            show_table(pd.DataFrame(summary_rows))
+            st.caption("Correlation runs from -1 to 1; 1 means the predicted order matched the result exactly. "
+                       "Avg error is how many places each driver was off, on average.")
+            st.markdown("**Race by race**")
+            detail = bt.copy()
+            for col in ("Pole", "Winner"):
+                if col in detail.columns:
+                    detail[col] = detail[col].map({True: "✓", False: "✗"})
+            for col in ("Q avg error", "R avg error", "Q correlation", "R correlation"):
+                if col in detail.columns:
+                    detail[col] = detail[col].round(2)
+            show_table(detail.drop(columns=["Round"]).fillna("–"))
+            st.caption("If the previous model scores better on several races, lower the recent form weight "
+                       "or turn off the team correction in Settings and run again.")
 
 st.caption("Built from FastF1 and OpenF1 data. Projections are estimates, not guarantees.")
