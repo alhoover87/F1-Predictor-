@@ -680,6 +680,8 @@ grid_weight = st.sidebar.slider(
 if st.sidebar.button("🔄 Refresh data"):
     st.cache_data.clear()
     st.rerun()
+data_box = st.sidebar.container(border=True)  # small "Data used" summary, filled in below
+data_lines = []
 
 round_number = int(event["RoundNumber"])
 circuit = event["Location"]
@@ -717,7 +719,7 @@ if not available:
     for short, err in load_errors.items():
         st.code(f"{short}: {err}")
     st.stop()
-st.info("Practice sessions used: " + ", ".join(available))
+data_lines.append("Sessions: " + ", ".join(available))
 
 if not selected_compounds:
     st.warning("Pick at least one tyre compound in Settings.")
@@ -731,8 +733,8 @@ if all(v is None or v.empty for v in session_laps.values()):
     st.warning("No laps on the selected tyre compounds in these sessions. Try adding another compound.")
     st.stop()
 if len(selected_compounds) < 3:
-    st.caption("Using only " + ", ".join(c.title() for c in ("SOFT", "MEDIUM", "HARD")
-                                         if c in selected_compounds) + " tyre laps.")
+    data_lines.append("Tyres: " + ", ".join(c.title() for c in ("SOFT", "MEDIUM", "HARD")
+                                              if c in selected_compounds) + " only")
 
 runs, runlaps = _stint_runs(session_laps, min_long_run)
 TEAM_COLOURS = team_colour_map(session_laps)
@@ -784,18 +786,22 @@ if race is not None and actual is not None:
 
 if official_grid is not None:
     grid_label = "Grid (official, with penalties)"
-    st.success("The official starting grid is out, so the race prediction uses it, "
-               "including any FIA grid penalties.")
+    data_lines.append("Grid: official FIA grid, with penalties")
 elif actual_quali is not None and announced_drops:
     grid_label = "Grid (quali + announced penalties)"
-    st.success("The race prediction uses the qualifying order with the announced penalties applied. "
-               "It will switch to the official FIA grid once it's published.")
+    data_lines.append("Grid: qualifying + announced penalties (official grid not out yet)")
 elif actual_quali is not None:
     grid_label = "Grid (actual quali)"
-    st.success("Qualifying is done, so the race prediction uses the real qualifying order. "
-               "It will switch to the official grid, with penalties, once the FIA publishes it.")
+    data_lines.append("Grid: actual qualifying (switches to the official grid once published)")
 else:
     grid_label = "Projected grid"
+    data_lines.append("Grid: projected from practice")
+data_lines.append(f"Long runs: {min_long_run}+ laps · Grid weight: {grid_weight:.0%}")
+
+with data_box:
+    st.markdown("**Data used**")
+    for line in data_lines:
+        st.caption(line)
 
 left, right = st.columns(2)
 with left:
