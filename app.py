@@ -1943,6 +1943,39 @@ with tab4:
                 fig3.update_layout(showlegend=False)
                 st.plotly_chart(style_fig(fig3), use_container_width=True, theme=None)
 
+# ---------- Backtest storage: results survive closing the app and resume if a run is cut off ----------
+BACKTEST_DIR = Path("/tmp/f1_backtest")
+
+
+def backtest_signature(s):
+    """Short text describing the settings a backtest was run with."""
+    parts = [f"fp={'+'.join(s['fp'])}", f"tyres={'+'.join(sorted(s['compounds']))}", f"runs={s['min_laps']}",
+             "grid=auto" if s["grid_weight"] is None else f"grid={s['grid_weight']:.0%}",
+             f"form={s['form_weight']:.0%}x{s['form_races']}", f"corr={'on' if s['correction'] else 'off'}",
+             f"evo={'on' if s['evolution'] else 'off'}", f"deg={s['deg_weight']:g}",
+             f"wet={s['wet_quali']}/{s['wet_discount']:.0%}"]
+    return " · ".join(parts)
+
+
+def backtest_path(year):
+    return BACKTEST_DIR / f"backtest_{year}.json"
+
+
+def load_backtest(year):
+    try:
+        return json.loads(backtest_path(year).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def save_backtest(year, data):
+    try:
+        BACKTEST_DIR.mkdir(parents=True, exist_ok=True)
+        backtest_path(year).write_text(json.dumps(data, default=str), encoding="utf-8")
+    except Exception:
+        pass
+
+
 with tab5:
     st.markdown("#### How accurate is the model?")
     st.write("Re-runs the prediction for past races this season and scores it against what actually "
@@ -1952,77 +1985,20 @@ with tab5:
     if not done_rounds:
         st.write("No completed races this season yet.")
     else:
+        test_settings = dict(settings)
+        test_settings["grid_weight"] = None if gw_note else settings["grid_weight"]  # auto-by-circuit unless overridden
+        sig = backtest_signature(test_settings)
+        saved = load_backtest(year)
+
         n_test = st.slider("Races to test (most recent first)", 1, len(done_rounds), min(5, len(done_rounds)))
         compare = st.checkbox("Also score the previous model (rank blend, 25% grid, 5-lap runs, no form, deg or team correction)", True)
-        st.caption("Uses your current Settings. Each race's form and team correction only use races before it, "
-                   "so nothing leaks from the result being tested. The first run downloads practice data for "
-                   "every race tested, so it can take a few minutes.")
-        if st.button("Run backtest"):
-            prog = st.progress(0.0)
-            status = st.empty()
-            rows = []
-            test_settings = dict(settings)
-            test_settings["grid_weight"] = None if gw_note else settings["grid_weight"]  # auto-by-circuit unless overridden
-            base_settings = {**BASELINE_SETTINGS, "fp": settings["fp"], "compounds": settings["compounds"]}
-            for i, ev in enumerate(done_rounds[:n_test]):
-                rnd = int(ev["RoundNumber"])
-                status.write(f"Scoring {ev['EventName']} ({i + 1} of {n_test})...")
-                for label_, cfg in ((("This model", test_settings),) + ((("Previous model", base_settings),) if compare else ())):
-                    row = {"Model": label_, "Round": rnd, "Race": ev["EventName"]}
-                    try:
-                        mm = run_model(year, rnd, ev, cfg)
-                        qs = score_prediction(mm["quali"], "ProjectedGrid", mm["actual_quali"], "Position")
-                        rs = score_prediction(mm["race"], "ProjectedFinish", mm["actual"], "ActualFinish")
-                        if qs:
-                            row.update({"Pole": qs["Top1"], "Q top3 hits": qs["Top3Hits"],
-                                        "Q avg error": qs["MAE"], "Q correlation": qs["Spearman"]})
-                        if rs:
-                            row.update({"Winner": rs["Top1"], "Podium hits": rs["Top3Hits"],
-                                        "Podium exact": rs["Top3Exact"], "R avg error": rs["MAE"],
-                                        "R correlation": rs["Spearman"]})
-                        if not qs and not rs:
-                            row["Note"] = "no data"
-                    except Exception as e:
-                        row["Note"] = f"{type(e).__name__}: {e}"
-                    rows.append(row)
-                prog.progress((i + 1) / n_test)
-            status.empty()
-            st.session_state["backtest"] = pd.DataFrame(rows)
-            st.session_state["backtest_year"] = year
-
-        bt = st.session_state.get("backtest")
-        if bt is not None and st.session_state.get("backtest_year") == year and not bt.empty:
-            summary_rows = []
-            for label_, g in bt.groupby("Model", sort=False):
-                def pct(col):
-                    return f"{g[col].mean() * 100:.0f}%" if col in g.columns and g[col].notna().any() else "–"
-
-                def avg(col, nd=2):
-                    return round(g[col].mean(), nd) if col in g.columns and g[col].notna().any() else "–"
-                summary_rows.append({
-                    "Model": label_,
-                    "Races": int(g["Pole"].notna().sum()) if "Pole" in g.columns else 0,
-                    "Pole right": pct("Pole"), "Quali top-3 hits (of 3)": avg("Q top3 hits"),
-                    "Quali avg error (places)": avg("Q avg error", 1),
-                    "Winner right": pct("Winner"), "Podium hits (of 3)": avg("Podium hits"),
-                    "Podium exact (of 3)": avg("Podium exact"),
-                    "Race avg error (places)": avg("R avg error", 1),
-                    "Race correlation": avg("R correlation"),
-                })
-            st.markdown("**Summary**")
-            show_table(pd.DataFrame(summary_rows))
-            st.caption("Correlation runs from -1 to 1; 1 means the predicted order matched the result exactly. "
-                       "Avg error is how many places each driver was off, on average.")
-            st.markdown("**Race by race**")
-            detail = bt.copy()
-            for col in ("Pole", "Winner"):
-                if col in detail.columns:
-                    detail[col] = detail[col].map({True: "✓", False: "✗"})
-            for col in ("Q avg error", "R avg error", "Q correlation", "R correlation"):
-                if col in detail.columns:
-                    detail[col] = detail[col].round(2)
-            show_table(detail.drop(columns=["Round"]).fillna("–"))
-            st.caption("If the previous model scores better on several races, lower the recent form weight "
-                       "or turn off the team correction in Settings and run again.")
-
-st.caption("Built from FastF1 and OpenF1 data. Projections are estimates, not guarantees.")
+        st.caption("Results only change when you press Run. They're saved as each race finishes, so if the "
+                   "app closes or times out part-way, press Run again and it picks up where it stopped. "
+                   "Each race's form and team correction only use races before it, so nothing leaks.")
+        c_run, c_clear = st.columns([1, 1])
+        run_clicked = c_run.button("Run backtest")
+        if c_clear.button("Clear saved results"):
+            try:
+                backtest_path(year).unlink()
+            except Exception:
+                pass
