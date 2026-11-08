@@ -552,9 +552,9 @@ def track_outline_svg(year, session_name, session_date_utc):
     vw, vh = w * scale + 2 * pad, h * scale + 2 * pad
     path = " ".join(f"{a:.1f},{b:.1f}" for a, b in zip(px_, py_))
     return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {vw:.0f} {vh:.0f}">'
-            f'<polyline points="{path}" fill="none" stroke="#CFFFDC" stroke-opacity="0.07" '
+            f'<polyline points="{path}" fill="none" stroke="#3E6F40" stroke-opacity="0.06" '
             f'stroke-width="26" stroke-linejoin="round" stroke-linecap="round"/>'
-            f'<polyline points="{path}" fill="none" stroke="#CFFFDC" stroke-opacity="0.12" '
+            f'<polyline points="{path}" fill="none" stroke="#3E6F40" stroke-opacity="0.10" '
             f'stroke-width="7" stroke-linejoin="round" stroke-linecap="round"/></svg>')
 
 
@@ -731,42 +731,45 @@ PALETTE = {"forest": "#3E6F40", "mint": "#CFFFDC", "leaf": "#68BA7F", "pine": "#
 def apply_palette():
     p = PALETTE
     st.markdown(f"""<style>
-    h1, h2, h3, h4 {{ color: {p['mint']} !important; }}
+    h1, h2, h3, h4 {{ color: {p['pine']} !important; }}
     h1 {{ border-bottom: 3px solid {p['leaf']}; padding-bottom: .3rem; }}
     [data-testid="stSidebar"] {{ border-right: 2px solid {p['leaf']}; }}
     [data-testid="stSidebar"] h1 {{ border-bottom: none; }}
     [data-testid="stVerticalBlockBorderWrapper"] {{
         border-color: {p['leaf']} !important;
-        background: rgba(62, 111, 64, 0.35);
+        background: rgba(207, 255, 220, 0.35);
     }}
     [data-testid="stSidebar"] [data-testid="stVerticalBlockBorderWrapper"] {{
-        background: rgba(37, 61, 44, 0.55);
+        background: #ffffff;
     }}
     [data-testid="stMetric"] {{
-        background: {p['forest']}; border: 1px solid {p['leaf']};
+        background: {p['mint']}; border: 1px solid {p['leaf']};
         border-radius: 10px; padding: .6rem .8rem;
     }}
-    [data-testid="stMetricValue"] {{ color: {p['mint']}; }}
+    [data-testid="stMetricValue"] {{ color: {p['pine']}; }}
     .stTabs [data-baseweb="tab-list"] {{ gap: .4rem; }}
     .stTabs [data-baseweb="tab"] {{
-        background: {p['forest']}; border-radius: 8px 8px 0 0; padding: .4rem .9rem;
+        background: {p['mint']}; border-radius: 8px 8px 0 0; padding: .4rem .9rem;
     }}
-    .stTabs [aria-selected="true"] {{ background: {p['leaf']}; color: {p['pine']} !important; }}
-    .stTabs [aria-selected="true"] p {{ color: {p['pine']} !important; font-weight: 700; }}
+    .stTabs [data-baseweb="tab"] p {{ color: {p['pine']}; }}
+    .stTabs [aria-selected="true"] {{ background: {p['forest']}; }}
+    .stTabs [aria-selected="true"] p {{ color: #ffffff !important; font-weight: 700; }}
     .stButton > button {{
-        background: {p['leaf']}; color: {p['pine']}; border: none; font-weight: 700;
+        background: {p['forest']}; color: #ffffff; border: none; font-weight: 700;
     }}
-    .stButton > button:hover {{ background: {p['mint']}; color: {p['pine']}; }}
+    .stButton > button:hover {{ background: {p['leaf']}; color: #ffffff; }}
     [data-testid="stExpander"] details {{ border-color: {p['leaf']} !important; }}
     </style>""", unsafe_allow_html=True)
 
 
 def style_fig(fig):
-    """Transparent chart backgrounds with palette-coloured text and grid lines."""
-    fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(37,61,44,0.45)",
-                      font_color=PALETTE["mint"], title_font_color=PALETTE["mint"])
-    fig.update_xaxes(gridcolor="rgba(207,255,220,0.12)", zerolinecolor="rgba(207,255,220,0.25)")
-    fig.update_yaxes(gridcolor="rgba(207,255,220,0.12)", zerolinecolor="rgba(207,255,220,0.25)")
+    """White chart backgrounds with palette-coloured text and grid lines."""
+    fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(255,255,255,0.85)",
+                      font_color=PALETTE["pine"], title_font_color=PALETTE["pine"])
+    fig.update_xaxes(gridcolor="rgba(62,111,64,0.15)", zerolinecolor="rgba(62,111,64,0.35)",
+                     linecolor="rgba(62,111,64,0.4)")
+    fig.update_yaxes(gridcolor="rgba(62,111,64,0.15)", zerolinecolor="rgba(62,111,64,0.35)",
+                     linecolor="rgba(62,111,64,0.4)")
     return fig
 
 
@@ -873,6 +876,7 @@ data_lines.append("Sessions: " + ", ".join(available))
 if not selected_compounds:
     st.warning("Pick a tyre type in Settings.")
     st.stop()
+session_laps_all = dict(session_laps)  # every compound, for the Long runs tab
 # keep only laps on the chosen compounds
 session_laps = {
     k: (v[v["Compound"].astype(str).str.upper().isin(selected_compounds)] if v is not None else None)
@@ -885,7 +889,9 @@ data_lines.append("Tyres: " + ", ".join(c.title() for c in ("SOFT", "MEDIUM", "H
                                           if c in selected_compounds))
 
 runs, runlaps = _stint_runs(session_laps, min_long_run)
-TEAM_COLOURS = team_colour_map(session_laps)
+runs_all, runlaps_all = _stint_runs(session_laps_all, min_long_run)
+offsets_all, _, shift_all = estimate_compound_offsets(runs_all)
+TEAM_COLOURS = team_colour_map(session_laps_all)
 compound_offsets, compound_source, session_shift = estimate_compound_offsets(runs)
 quali = quali_projection(session_laps, compound_offsets)
 pace = long_run_pace(runs, compound_offsets, session_shift)
@@ -1087,31 +1093,37 @@ with tab3:
         st.plotly_chart(style_fig(fig), use_container_width=True, theme=None)
 
 with tab4:
-    if runlaps is None or runlaps.empty:
+    if runlaps_all is None or runlaps_all.empty:
         st.write(f"No long runs of {min_long_run}+ laps found. Try lowering the minimum long-run length in Settings.")
     else:
-        lr = runlaps.copy()
+        lr = runlaps_all.copy()
         # medium-equivalent, track-evolution-corrected lap times (what the model uses)
-        lr["Adjusted"] = (lr["LapSeconds"] - lr["Compound"].map(compound_offsets).fillna(0.0)
-                          - lr["Session"].map(session_shift or {}).fillna(0.0))
+        lr["Adjusted"] = (lr["LapSeconds"] - lr["Compound"].map(offsets_all).fillna(0.0)
+                          - lr["Session"].map(shift_all or {}).fillna(0.0))
 
         order = list(race["Driver"]) if race is not None and not race.empty else sorted(lr["Driver"].unique())
         order = [d for d in order if d in set(lr["Driver"])]
-        c1, c2, c3 = st.columns([3, 1.3, 1.5])
-        picked = c1.multiselect("Drivers", order, default=order[:6],
+        picked = st.multiselect("Drivers", order, default=order[:6],
                                 help="Defaults to the top 6 in the race projection.")
+        c2, c3, c4 = st.columns([1.2, 2.2, 1.5])
         sess_opts = ["All"] + sorted(lr["Session"].unique())
         sess_pick = c2.selectbox("Session", sess_opts)
-        view = c3.radio("Lap times", ["Raw", "Adjusted"], horizontal=True,
+        tyre_opts = [c for c in ("SOFT", "MEDIUM", "HARD") if c in set(lr["Compound"])]
+        tyre_default = [c for c in tyre_opts if c in selected_compounds] or tyre_opts
+        tyres_pick = c3.multiselect("Tyres", tyre_opts, default=tyre_default,
+                                    format_func=str.title,
+                                    help="Starts with your Tyre type setting; change it here "
+                                         "to look at other compounds without changing the predictions.")
+        view = c4.radio("Lap times", ["Raw", "Adjusted"], horizontal=True,
                         help="Adjusted = converted to medium tyres and corrected for track "
                              "evolution, the way the model compares them.")
         y_col = "LapSeconds" if view == "Raw" else "Adjusted"
 
-        sel = lr[lr["Driver"].isin(picked)]
+        sel = lr[lr["Driver"].isin(picked) & lr["Compound"].isin(tyres_pick)]
         if sess_pick != "All":
             sel = sel[sel["Session"] == sess_pick]
         if sel.empty:
-            st.write("Pick at least one driver with a long run in that session.")
+            st.write("No long runs match those drivers, session and tyres.")
         else:
             dash = teammate_dash(set(zip(lr["Driver"], lr["Team"])))
             sel = sel.copy()
@@ -1149,8 +1161,9 @@ with tab4:
             fig2.update_layout(showlegend=False)
             st.plotly_chart(style_fig(fig2), use_container_width=True, theme=None)
 
-            deg = (runs[runs["Driver"].isin(picked)] if sess_pick == "All"
-                   else runs[runs["Driver"].isin(picked) & (runs["Session"] == sess_pick)])
+            deg = runs_all[runs_all["Driver"].isin(picked) & runs_all["Compound"].isin(tyres_pick)]
+            if sess_pick != "All":
+                deg = deg[deg["Session"] == sess_pick]
             if not deg.empty:
                 deg = deg.groupby(["Driver", "Team"])["DegPerLap"].mean().reset_index()
                 deg = deg.sort_values("DegPerLap")
