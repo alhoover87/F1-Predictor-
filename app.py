@@ -1995,10 +1995,8 @@ with tab5:
         st.caption("Results only change when you press Run. They're saved as each race finishes, so if the "
                    "app closes or times out part-way, press Run again and it picks up where it stopped. "
                    "Each race's form and team correction only use races before it, so nothing leaks.")
-        c_run, c_clear = st.columns([1, 1])
-        run_clicked = c_run.button("Run backtest")
-        if c_clear.button("Clear saved results"):
-            try:
-                backtest_path(year).unlink()
-            except Exception:
-                pass
+        job = st.session_state.get("bt_job")
+        running = bool(job and job.get("year") == year)
+        c_run, c_stop, c_clear = st.columns([1, 1, 1])
+        run_clicked = c_run.button("Run backtest", disabled=running)
+        if running and c_stop.but
