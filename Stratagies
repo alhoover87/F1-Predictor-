@@ -1,0 +1,19 @@
+{
+  "_how_to_use": "One entry per race, keyed season-round, e.g. 2026-20. grid_drops: {\"HAM\": 10} for 10 places back, {\"HAM\": \"back\"} for back of grid, {\"HAM\": \"pitlane\"} for pit-lane start. The official FIA grid replaces grid_drops once it is published.",
+  "2026-20": {
+    "strategy": "Two stops: Soft – Soft – Medium",
+    "details": [
+      "Adding the Hard to two Soft stints is slower overall",
+      "One stop is about 10 seconds slower than the best two-stop",
+      "Cool race day (around 17°C) favours the softer tyres",
+      "50–60% chance of rain could bring Intermediates into play"
+    ],
+    "compounds": ["SOFT", "MEDIUM"],
+    "source": "Pirelli, after qualifying",
+    "url": "https://press.pirelli.com/from-full-wets-to-inters-in-qualifying-norris-takes-pole-in-so-paulo/",
+    "grid_drops": {},
+    "penalty_notes": [
+      "Reported: Hamilton has a further power unit penalty. Details will show once the official grid is out."
+    ]
+  }
+}
