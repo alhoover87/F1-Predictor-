@@ -4,6 +4,8 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import requests
+import json
+from pathlib import Path
 import logging
 import time
 from datetime import datetime
@@ -478,6 +480,39 @@ def race_projection(quali, pace, grid_weight, known_grid=None):
     return df
 
 
+# ---------- Pirelli strategy + announced penalties (from strategies.json) ----------
+def load_race_notes(year, round_number):
+    """Reads this race's entry from strategies.json in the repo, if there is one."""
+    path = Path(__file__).parent / "strategies.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data.get(f"{year}-{round_number}", {})
+
+
+def apply_grid_drops(grid, drops):
+    """Applies announced penalties to a qualifying order.
+    drops: {"HAM": 10} = 10 places back, {"HAM": "back"} = back of the grid."""
+    if grid is None or not drops:
+        return grid
+    g = grid.copy()
+    n = len(g)
+    keys = []
+    for i, r in enumerate(g.itertuples()):
+        d = drops.get(r.Driver)
+        if d is None:
+            keys.append(r.Position)
+        elif isinstance(d, str):          # "back" or "pitlane"
+            keys.append(n + 100 + (1 if d.lower() == "pitlane" else 0) + i / 1000)
+        else:                             # N places, sits behind the car it lands on
+            keys.append(r.Position + int(d) + 0.5)
+    g["_k"] = keys
+    g = g.sort_values("_k").drop(columns="_k").reset_index(drop=True)
+    g["Position"] = range(1, len(g) + 1)
+    return g
+
+
 # ---------- UI ----------
 st.title("F1 Podium Predictor")
 
@@ -580,7 +615,14 @@ quali = quali_projection(session_laps, compound_offsets)
 pace = long_run_pace(runs, compound_offsets, session_shift)
 actual_quali = load_session_result(year, round_number, event, "Qualifying", 1.5)
 official_grid = load_starting_grid(year, round_number, event) if actual_quali is not None else None
-known_grid = official_grid if official_grid is not None else actual_quali
+race_notes = load_race_notes(year, round_number)
+announced_drops = race_notes.get("grid_drops", {}) or {}
+if official_grid is not None:
+    known_grid = official_grid
+elif actual_quali is not None and announced_drops:
+    known_grid = apply_grid_drops(actual_quali, announced_drops)
+else:
+    known_grid = actual_quali
 race = race_projection(quali, pace, grid_weight, known_grid)
 
 # drivers whose start slot differs from where they qualified (penalties, pit-lane starts)
@@ -595,6 +637,14 @@ if official_grid is not None and actual_quali is not None:
         gc["Change"] = gc["Starts"] - gc["Qualified"]
         gc = gc[gc["Change"] > 0]  # only penalised drivers; others just move up behind them
         grid_changes = gc.sort_values("Change", ascending=False) if not gc.empty else None
+elif actual_quali is not None and announced_drops:
+    gc = actual_quali.rename(columns={"Position": "Qualified"}).merge(
+        known_grid.rename(columns={"Position": "Starts"}), on="Driver", how="inner")
+    gc["Qualified"] = gc["Qualified"].astype(int)
+    gc["Starts"] = gc["Starts"].astype(int)
+    gc["Change"] = gc["Starts"] - gc["Qualified"]
+    gc = gc[gc["Driver"].isin(announced_drops.keys())]
+    grid_changes = gc.sort_values("Change", ascending=False) if not gc.empty else None
 
 actual = load_session_result(year, round_number, event, "Race", 3)
 if actual is not None:
@@ -606,12 +656,60 @@ if official_grid is not None:
     grid_label = "Grid (official, with penalties)"
     st.success("The official starting grid is out, so the race prediction uses it, "
                "including any FIA grid penalties.")
+elif actual_quali is not None and announced_drops:
+    grid_label = "Grid (quali + announced penalties)"
+    st.success("The race prediction uses the qualifying order with the announced penalties applied. "
+               "It will switch to the official FIA grid once it's published.")
 elif actual_quali is not None:
     grid_label = "Grid (actual quali)"
     st.success("Qualifying is done, so the race prediction uses the real qualifying order. "
                "It will switch to the official grid, with penalties, once the FIA publishes it.")
 else:
     grid_label = "Projected grid"
+
+left, right = st.columns(2)
+with left:
+    with st.container(border=True):
+        st.markdown("#### 🛞 Pirelli's likely race strategy")
+        if race_notes.get("strategy"):
+            st.markdown(f"**{race_notes['strategy']}**")
+            for line in race_notes.get("details", []):
+                st.markdown(f"- {line}")
+            plan = {c.upper() for c in race_notes.get("compounds", [])}
+            if plan:
+                if plan == selected_compounds:
+                    st.caption("✓ Your tyre settings match this strategy.")
+                else:
+                    st.caption("Tip: to match this strategy, tick only " +
+                               " + ".join(c.title() for c in ("SOFT", "MEDIUM", "HARD") if c in plan) +
+                               " in Settings.")
+            src = race_notes.get("source", "Pirelli")
+            if race_notes.get("url"):
+                st.caption(f"Source: [{src}]({race_notes['url']})")
+            else:
+                st.caption(f"Source: {src}")
+        else:
+            st.write("No strategy entered for this race yet.")
+            st.caption("Pirelli usually publishes its strategy call after qualifying. "
+                       "Add it to strategies.json in the repo to show it here.")
+with right:
+    with st.container(border=True):
+        st.markdown("#### ⚠️ Grid penalties")
+        if grid_changes is not None:
+            gshow = grid_changes.copy()
+            gshow["Change"] = gshow["Change"].map(lambda x: f"{x} place{'s' if x != 1 else ''} back")
+            st.dataframe(gshow, hide_index=True, use_container_width=True)
+            st.caption("From the official FIA grid." if official_grid is not None
+                       else "From announced penalties (strategies.json). The official grid will replace this.")
+        elif official_grid is not None:
+            st.write("None. The official grid matches qualifying.")
+        elif actual_quali is not None:
+            st.write("Official grid not published yet.")
+            st.caption("The FIA usually confirms it on race morning.")
+        else:
+            st.write("Shown after qualifying.")
+        for note in race_notes.get("penalty_notes", []):
+            st.caption(note)
 
 tab1, tab2, tab3 = st.tabs(["🏆 Podium", "⏱️ Qualifying", "🏎️ Race"])
 
@@ -703,13 +801,6 @@ with tab3:
             if session_shift:
                 st.write("Track evolution correction (long runs, vs the first session used): " +
                          ", ".join(f"{k} {v:+.2f}s" for k, v in session_shift.items()))
-        if grid_changes is not None:
-            st.markdown("**Grid penalties** (drivers starting behind where they qualified)")
-            gshow = grid_changes.copy()
-            gshow["Change"] = gshow["Change"].map(lambda x: f"{x} place{'s' if x != 1 else ''} back")
-            st.dataframe(gshow, hide_index=True, use_container_width=True)
-        elif official_grid is not None:
-            st.caption("Official grid matches qualifying, no penalties applied.")
         fig = px.scatter(race, x="RaceGapPct", y="DegPerLap", text="Driver",
                          color="Team", title="Long-run pace vs tyre degradation")
         fig.update_traces(textposition="top center")
