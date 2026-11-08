@@ -12,6 +12,7 @@ import unicodedata
 import xml.etree.ElementTree as ET
 from pathlib import Path
 import logging
+import threading
 import time
 from datetime import datetime
 
@@ -1976,6 +1977,54 @@ def save_backtest(year, data):
         pass
 
 
+@st.cache_resource(show_spinner=False)
+def backtest_jobs():
+    """Status of background backtests, shared by every open browser tab."""
+    return {}
+
+
+def _score_one(year, rnd, ev, label_, cfg):
+    row = {"Model": label_, "Round": rnd, "Race": ev["EventName"]}
+    try:
+        mm = run_model(year, rnd, ev, cfg)
+        qs = score_prediction(mm["quali"], "ProjectedGrid", mm["actual_quali"], "Position")
+        rs = score_prediction(mm["race"], "ProjectedFinish", mm["actual"], "ActualFinish")
+        if qs:
+            row.update({"Pole": qs["Top1"], "Q top3 hits": qs["Top3Hits"],
+                        "Q avg error": qs["MAE"], "Q correlation": qs["Spearman"]})
+        if rs:
+            row.update({"Winner": rs["Top1"], "Podium hits": rs["Top3Hits"],
+                        "Podium exact": rs["Top3Exact"], "R avg error": rs["MAE"],
+                        "R correlation": rs["Spearman"]})
+        if not qs and not rs:
+            row["Note"] = "no data"
+    except Exception as e:
+        row["Note"] = f"{type(e).__name__}: {e}"
+    return row
+
+
+def _backtest_worker(year, queue, sig, n_test, registry):
+    """Runs in a background thread so the browser can disconnect and the work carries on.
+    Saves after every race."""
+    j = registry[year]
+    try:
+        for label_, rnd, ev, cfg in queue:
+            if j.get("stop"):
+                break
+            j["current"] = f"{ev['EventName']}: {label_}"
+            row = _score_one(year, rnd, ev, label_, cfg)
+            data = load_backtest(year) or {"signature": sig, "rows": []}
+            rows = [r for r in data.get("rows", []) if not (r["Model"] == label_ and r["Round"] == rnd)] + [row]
+            j["done"] += 1
+            save_backtest(year, {"signature": sig, "rows": rows, "races": n_test,
+                                 "complete": j["done"] >= j["total"],
+                                 "updated": datetime.now().strftime("%d %b %Y %H:%M")})
+        j["status"] = "stopped" if j.get("stop") else "done"
+    except Exception as e:
+        j["status"] = "error"
+        j["error"] = f"{type(e).__name__}: {e}"
+
+
 with tab5:
     st.markdown("#### How accurate is the model?")
     st.write("Re-runs the prediction for past races this season and scores it against what actually "
@@ -1995,81 +2044,59 @@ with tab5:
         st.caption("Results only change when you press Run. They're saved as each race finishes, so if the "
                    "app closes or times out part-way, press Run again and it picks up where it stopped. "
                    "Each race's form and team correction only use races before it, so nothing leaks.")
-        job = st.session_state.get("bt_job")
-        running = bool(job and job.get("year") == year)
+        registry = backtest_jobs()
+        job = registry.get(year)
+        running = bool(job and job.get("status") == "running")
         c_run, c_stop, c_clear = st.columns([1, 1, 1])
         run_clicked = c_run.button("Run backtest", disabled=running)
         if running and c_stop.button("Stop"):
-            del st.session_state["bt_job"]
-            st.rerun()
+            job["stop"] = True
         if c_clear.button("Clear saved results", disabled=running):
             try:
                 backtest_path(year).unlink()
             except Exception:
                 pass
-            if "bt_job" in st.session_state:
-                del st.session_state["bt_job"]
+            registry.pop(year, None)
             st.rerun()
 
         if run_clicked:
-            # A run is a queue of (model, round) jobs. Each page refresh scores ONE job, saves it,
-            # then refreshes again, so no single step runs long enough to time out, and a run
-            # that gets cut off resumes from the saved file on the next press.
+            # The backtest runs on the server in the background. Close the app, lock the phone,
+            # come back later: the saved table keeps filling in race by race.
             rows = []
             if saved and saved.get("signature") == sig and not saved.get("complete"):
                 rows = saved.get("rows", [])  # unfinished run with the same settings: resume it
             done_keys = {(r["Model"], r["Round"]) for r in rows}
             base_settings = {**BASELINE_SETTINGS, "fp": settings["fp"], "compounds": settings["compounds"]}
             models = [("This model", test_settings)] + ([("Previous model", base_settings)] if compare else [])
-            pending = [(label_, int(ev["RoundNumber"])) for ev in done_rounds[:n_test] for label_, _ in models
-                       if (label_, int(ev["RoundNumber"])) not in done_keys]
-            st.session_state["bt_job"] = {"year": year, "sig": sig, "pending": pending,
-                                          "total": len(models) * n_test, "n_test": n_test,
-                                          "models": dict(models)}
-            save_backtest(year, {"signature": sig, "rows": rows, "complete": False, "races": n_test,
+            queue = [(label_, int(ev["RoundNumber"]), ev, cfg)
+                     for ev in done_rounds[:n_test] for label_, cfg in models
+                     if (label_, int(ev["RoundNumber"])) not in done_keys]
+            registry[year] = {"status": "running", "done": len(models) * n_test - len(queue),
+                              "total": len(models) * n_test, "current": "starting...", "stop": False, "sig": sig}
+            save_backtest(year, {"signature": sig, "rows": rows, "complete": not queue, "races": n_test,
                                  "updated": datetime.now().strftime("%d %b %Y %H:%M")})
+            if queue:
+                t = threading.Thread(target=_backtest_worker, args=(year, queue, sig, n_test, registry), daemon=True)
+                try:  # lets the worker use Streamlit's data cache without warnings
+                    from streamlit.runtime.scriptrunner import add_script_run_ctx
+                    add_script_run_ctx(t)
+                except Exception:
+                    pass
+                t.start()
+            else:
+                registry[year]["status"] = "done"
             st.rerun()
 
+        if job and job.get("status") == "error":
+            st.error(f"Backtest stopped with an error: {job.get('error')}")
         if running:
-            saved = load_backtest(year) or {"signature": job["sig"], "rows": []}
-            rows = saved.get("rows", [])
-            total = max(job["total"], 1)
-            done_n = total - len(job["pending"])
-            st.progress(min(done_n / total, 1.0), text=f"Backtest running: {done_n} of {total} scored")
-            if job["pending"]:
-                label_, rnd = job["pending"][0]
-                ev_by_round = {int(e["RoundNumber"]): e for e in done_rounds}
-                ev = ev_by_round.get(rnd)
-                with st.spinner(f"Scoring {ev['EventName'] if ev is not None else f'round {rnd}'}: {label_}..."):
-                    row = {"Model": label_, "Round": rnd, "Race": ev["EventName"] if ev is not None else f"Round {rnd}"}
-                    try:
-                        if ev is None:
-                            raise ValueError("round not found in schedule")
-                        mm = run_model(year, rnd, ev, job["models"][label_])
-                        qs = score_prediction(mm["quali"], "ProjectedGrid", mm["actual_quali"], "Position")
-                        rs = score_prediction(mm["race"], "ProjectedFinish", mm["actual"], "ActualFinish")
-                        if qs:
-                            row.update({"Pole": qs["Top1"], "Q top3 hits": qs["Top3Hits"],
-                                        "Q avg error": qs["MAE"], "Q correlation": qs["Spearman"]})
-                        if rs:
-                            row.update({"Winner": rs["Top1"], "Podium hits": rs["Top3Hits"],
-                                        "Podium exact": rs["Top3Exact"], "R avg error": rs["MAE"],
-                                        "R correlation": rs["Spearman"]})
-                        if not qs and not rs:
-                            row["Note"] = "no data"
-                    except Exception as e:
-                        row["Note"] = f"{type(e).__name__}: {e}"
-                    rows = [r for r in rows if not (r["Model"] == label_ and r["Round"] == rnd)] + [row]
-                    job["pending"] = job["pending"][1:]
-                    st.session_state["bt_job"] = job
-                    save_backtest(year, {"signature": job["sig"], "rows": rows, "complete": not job["pending"],
-                                         "races": job["n_test"],
-                                         "updated": datetime.now().strftime("%d %b %Y %H:%M")})
-                st.rerun()
-            else:
-                save_backtest(year, {**saved, "complete": True})
-                del st.session_state["bt_job"]
-                st.rerun()
+            total = max(job.get("total", 1), 1)
+            st.progress(min(job.get("done", 0) / total, 1.0),
+                        text=f"Backtest running in the background: {job.get('done', 0)} of {total} scored · "
+                             f"now {job.get('current', '')}")
+            st.caption("This page refreshes itself every few seconds. You can close it; the run continues "
+                       "and the results below will be here when you come back.")
+            saved = load_backtest(year)
 
         if saved and saved.get("rows"):
             bt = pd.DataFrame(saved["rows"]).sort_values(["Round", "Model"], ascending=[False, True])
@@ -2116,5 +2143,8 @@ with tab5:
             show_table(detail.drop(columns=["Round"]).fillna("–"))
             st.caption("If the previous model scores better on several races, lower the recent form weight "
                        "or turn off the team correction in Settings and run again.")
+        if running:
+            time.sleep(5)
+            st.rerun()
 
 st.caption("Built from FastF1 and OpenF1 data. Projections are estimates, not guarantees.")
