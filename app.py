@@ -5,6 +5,7 @@ import numpy as np
 import plotly.express as px
 import requests
 import json
+import base64
 import re
 import html as htmllib
 import unicodedata
@@ -503,6 +504,88 @@ def race_projection(quali, pace, grid_weight, known_grid=None):
     return df
 
 
+@st.cache_data(ttl=7 * 86400, show_spinner=False)
+def track_outline_svg(year, session_name, session_date_utc):
+    """Traces one fast lap from OpenF1 car-position data and returns the circuit
+    shape as an SVG string (or None). OpenF1 position data starts in 2023."""
+    sessions = _openf1_get("sessions", year=year, session_name=session_name)
+    if not sessions:
+        return None
+    target = pd.Timestamp(session_date_utc)
+    target = target.tz_localize("UTC") if target.tzinfo is None else target.tz_convert("UTC")
+    best = min(sessions, key=lambda x: abs(pd.Timestamp(x["date_start"]).tz_convert("UTC") - target))
+    if abs(pd.Timestamp(best["date_start"]).tz_convert("UTC") - target) > pd.Timedelta(days=2):
+        return None
+    key = best["session_key"]
+    laps = pd.DataFrame(_openf1_get("laps", session_key=key))
+    if laps.empty or "lap_duration" not in laps.columns:
+        return None
+    laps = laps.dropna(subset=["lap_duration", "date_start"])
+    if "is_pit_out_lap" in laps.columns:
+        laps = laps[laps["is_pit_out_lap"] != True]
+    if laps.empty:
+        return None
+    lap = laps.sort_values("lap_duration").iloc[0]
+    start = pd.Timestamp(lap["date_start"]).tz_convert("UTC")
+    end = start + pd.Timedelta(seconds=float(lap["lap_duration"]))
+    fmt = lambda t: t.strftime("%Y-%m-%dT%H:%M:%S")
+    # OpenF1 wants the > and < operators unencoded in the URL
+    url = (f"{OPENF1}/location?session_key={key}&driver_number={int(lap['driver_number'])}"
+           f"&date>{fmt(start)}&date<{fmt(end)}")
+    time.sleep(0.4)
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    pts = pd.DataFrame(r.json())
+    if pts.empty or not {"x", "y"} <= set(pts.columns):
+        return None
+    pts = pts[(pts["x"] != 0) | (pts["y"] != 0)]
+    if len(pts) < 50:
+        return None
+    x, y = pts["x"].to_numpy(float), pts["y"].to_numpy(float)
+    if (y.max() - y.min()) > (x.max() - x.min()):  # lay tall tracks on their side
+        x, y = y, -x
+    w, h = x.max() - x.min(), y.max() - y.min()
+    scale = 1000 / max(w, h)
+    px_ = (x - x.min()) * scale + 40
+    py_ = (y.max() - y) * scale + 40  # SVG y runs downward
+    vw, vh = w * scale + 80, h * scale + 80
+    path = " ".join(f"{a:.1f},{b:.1f}" for a, b in zip(px_, py_))
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {vw:.0f} {vh:.0f}">'
+            f'<polyline points="{path}" fill="none" stroke="#ffffff" stroke-opacity="0.08" '
+            f'stroke-width="26" stroke-linejoin="round" stroke-linecap="round"/>'
+            f'<polyline points="{path}" fill="none" stroke="#ffffff" stroke-opacity="0.10" '
+            f'stroke-width="7" stroke-linejoin="round" stroke-linecap="round"/></svg>')
+
+
+def set_track_background(event, year):
+    """Puts the selected circuit's outline faintly behind the page."""
+    svg = None
+    for sname in ("Practice 1", "Practice 2", "Practice 3", "Qualifying", "Race"):
+        sdate = session_date_for(event, sname)
+        if sdate is None:
+            continue
+        if (sdate.tz_localize("UTC") if sdate.tzinfo is None else sdate) > pd.Timestamp.now(tz="UTC"):
+            continue
+        try:
+            svg = track_outline_svg(year, sname, sdate.isoformat())
+        except Exception:
+            svg = None
+        if svg:
+            break
+    if not svg:
+        return
+    b64 = base64.b64encode(svg.encode()).decode()
+    st.markdown(f"""<style>
+    [data-testid="stApp"] {{
+        background-image: url("data:image/svg+xml;base64,{b64}");
+        background-repeat: no-repeat;
+        background-position: center 60%;
+        background-size: min(85vw, 1100px) auto;
+        background-attachment: fixed;
+    }}
+    </style>""", unsafe_allow_html=True)
+
+
 def team_colour_map(session_laps):
     """Team -> '#rrggbb' using the colours F1 live timing publishes."""
     frames = [v[["Team", "TeamColor"]] for v in session_laps.values()
@@ -649,6 +732,8 @@ labels = [f"R{int(r.RoundNumber)} – {r.EventName}" for r in events.itertuples(
 pick = st.sidebar.selectbox("Track", range(len(labels)), index=default_idx,
                             format_func=lambda i: labels[i])
 event = events.iloc[pick]
+data_box = st.sidebar.container(border=True)  # small "Data used" summary, filled in below
+data_lines = []
 FP_CHOICES = {
     "All sessions (FP1 + FP2 + FP3)": ["FP1", "FP2", "FP3"],
     "FP1 only": ["FP1"],
@@ -680,10 +765,9 @@ grid_weight = st.sidebar.slider(
 if st.sidebar.button("🔄 Refresh data"):
     st.cache_data.clear()
     st.rerun()
-data_box = st.sidebar.container(border=True)  # small "Data used" summary, filled in below
-data_lines = []
 
 round_number = int(event["RoundNumber"])
+set_track_background(event, year)
 circuit = event["Location"]
 st.subheader(f"{event['EventName']} – {year}, Round {round_number}")
 st.caption(f"{circuit}, {event['Country']}")
