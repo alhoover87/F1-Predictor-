@@ -1209,13 +1209,13 @@ def commons_aerial_image(circuit_name, location):
 
 
 def set_track_photo_background(photo):
-    """Aerial photo behind the main panel at 10% strength: a 90% white wash sits over it so
+    """Aerial photo behind the main panel at 20% strength: an 80% white wash sits over it so
     the tables and charts stay readable."""
     if not photo or not photo.get("url"):
         return False
     st.markdown(f"""<style>
     [data-testid="stMain"], section.main {{
-        background-image: linear-gradient(rgba(255,255,255,0.90), rgba(255,255,255,0.90)),
+        background-image: linear-gradient(rgba(255,255,255,0.80), rgba(255,255,255,0.80)),
                           url("{photo['url']}");
         background-repeat: no-repeat;
         background-position: center center;
